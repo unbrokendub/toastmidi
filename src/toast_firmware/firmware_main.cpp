@@ -91,6 +91,7 @@ Mode     mode = M_PLAY;
 bool     swapLayers = false;    // true: поты без шифта крутят ноты, CC — под шифтом
 bool     comboLatched = false;  // защёлка комбо SHIFT+обе октавы
 int8_t   previewNote = -1;      // нота, выбираемая потом — подсветка на пиано
+uint8_t  velocity = KEY_VELOCITY;  // velocity нот, крутится value-потом в игре
 
 uint16_t potFilt[9];
 uint16_t potLatch[9];
@@ -201,7 +202,7 @@ void sendCC(uint8_t cc, uint8_t val) {
 
 void sendNote(uint8_t note, bool on) {
   uint8_t st = (on ? 0x90 : 0x80) | midiCh;
-  uint8_t vel = on ? KEY_VELOCITY : 0;
+  uint8_t vel = on ? velocity : 0;
   midiEventPacket_t p = {(uint8_t)(on ? 0x09 : 0x08), st, note, vel};
   MidiUSB.sendMIDI(p);
   usbDirty = true;
@@ -351,7 +352,16 @@ void updatePots() {
     char b[20];
     switch (mode) {
       case M_PLAY:
-        if (i == POT_VALUE) break;               // value-пот в игре молчит
+        if (i == POT_VALUE) {                    // value-пот в игре = velocity
+          uint8_t v = f >> 3;
+          if (v < 1) v = 1;                      // 0 = note-off, нельзя
+          if (v != velocity) {
+            velocity = v;
+            snprintf(b, sizeof(b), "VELOCITY %u", velocity);
+            setOverlay(b);
+          }
+          break;
+        }
         if (swapLayers) {
           if (potToKey[i] >= 0) assignKeyNote(potToKey[i], f);
         } else {
@@ -550,7 +560,8 @@ void setup() {
     potSent7[i] = raw >> 3;
   }
   latchPots();
-  for (uint8_t i = 0; i < N_POTS; i++) potArmed[i] = true;  // в игре поты живые сразу
+  for (uint8_t i = 0; i < N_POTS; i++) potArmed[i] = true;  // CC-поты живые сразу
+  potArmed[POT_VALUE] = false;  // velocity = 127, пока value-пот не тронут
   for (uint8_t i = 0; i < N_KEYS; i++) {
     keyState[i] = keyRead[i] = false;
     keyT[i] = 0;
