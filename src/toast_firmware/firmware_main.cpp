@@ -1142,7 +1142,10 @@ void assignKeyNote(uint8_t j, uint16_t filt) {
 void updatePots() {
   for (uint8_t i = 0; i < N_POTS; i++) {
     uint16_t raw = readNode(POTS[i].src, POTS[i].chan);
-    potFilt[i] = (potFilt[i] * 3 + raw) >> 2;
+    // Максимально резкий EMA, но фильтр остаётся: 7/8 нового + 1/8 старого.
+    // Реагирует почти мгновенно (за ~1.5 чтения), но одиночные выбросы АЦП
+    // всё же пригашиваются. В покое дребезг ловит дедбэнд POT_SEND_THRESHOLD.
+    potFilt[i] = (uint16_t)((potFilt[i] + raw * 7) >> 3);
     uint16_t f = potFilt[i];
 
     if (!potArmed[i]) {
