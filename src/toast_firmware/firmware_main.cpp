@@ -58,7 +58,7 @@ struct ScaleDef {
   char name[11];
 };
 
-constexpr uint8_t N_SCALES = 76;
+constexpr uint8_t N_SCALES = 84;
 constexpr uint8_t SCALE_BP_LAMBDA = 49;
 constexpr uint8_t SCALE_BP_CHROMA = 50;
 
@@ -75,6 +75,7 @@ const uint16_t SCALE_MASKS[N_SCALES] PROGMEM = {
   0x04ED, 0x06ED, 0x04EB, 0x03A7, 0x0D39, 0x035B, 0x09ED, 0x0673,
   0x0D73, 0x0D4B, 0x06B3, 0x052B, 0x09D3, 0x0B65, 0x05BB, 0x0D6D,
   0x0AB3, 0x06AF, 0x0BAD, 0x0DAD,
+  0x0EAD, 0x06FD, 0x02A9, 0x0B55, 0x0ACD, 0x0D55, 0x08A9, 0x09CB,
 };
 
 const uint8_t BP_LAMBDA_DEGREES[9] PROGMEM =
@@ -82,7 +83,7 @@ const uint8_t BP_LAMBDA_DEGREES[9] PROGMEM =
 const uint8_t BP_CHROMA_DEGREES[13] PROGMEM =
     {0, 1, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18};
 
-// Null-packed вместо [76][11]: полный текст имён без 110 padding bytes.
+// Null-packed вместо [N_SCALES][11]: полный текст имён без padding bytes.
 // Scale меняется редко, поэтому линейный проход по flash дешевле offsets table.
 const char SCALE_NAMES[] PROGMEM =
   "CHROMATIC\0MAJOR\0MINOR\0HARM MINOR\0MEL MINOR\0DORIAN\0"
@@ -98,7 +99,9 @@ const char SCALE_NAMES[] PROGMEM =
   "BLUES MOD\0BLUES OCT\0BLUES PHRY\0CHROM DOR\0CHROM PHRY\0"
   "ULTRA LOCR\0ALGERIAN\0ORIENTAL\0ENIGMA 8\0ENIGMA MIN\0BHAIRAV\0"
   "RITSU\0PURAVI bVI\0NOHKAN\0FLAMENCO\0SCHWARZ 42\0BHAIRUBAHR\0"
-  "ADONAI MLK\0ZIRAFKEND\0UTIL MINOR";
+  "ADONAI MLK\0ZIRAFKEND\0UTIL MINOR\0"
+  "BEBOP DOR\0BLUES BOTH\0MIN6 PENTA\0LYD AUG\0"
+  "LYD b3\0LEAD WHOLE\0HMIN PENTA\0TODI 12T";
 
 // ================== harmony data ==================
 
@@ -106,6 +109,7 @@ enum ChordQuality : uint8_t {
   Q_MAJ, Q_MIN, Q_DOM7, Q_MAJ7, Q_MIN7, Q_DIM, Q_HDIM7, Q_AUG
 };
 enum ChordSpread : uint8_t { SP_CLOSE, SP_WIDE, SP_DROP2, SP_DROP3 };
+enum VoiceLeadMode : uint8_t { VL_OFF, VL_SMOOTH, VL_BASS, VL_TOP };
 
 constexpr uint8_t CHORD_PROFILE_COUNT = 6;
 constexpr uint8_t CHORD_BANK_COUNT = 8;
@@ -147,9 +151,12 @@ const uint8_t PROGRESSION_BANKS[CHORD_BANK_COUNT][N_NOTE_KEYS] PROGMEM = {
 };
 #undef CHORD_DESC
 
-// Low nibble first, high nibble second. 0=P, 1=R, 2=L, 0xF=stop.
-const uint8_t PLR_SEQUENCES[7] PROGMEM =
-    {0xF0, 0xF1, 0xF2, 0x10, 0x20, 0x01, 0x21};
+// bits 7..6 = count-1; три 2-bit операции идут снизу вверх.
+// 0=P, 1=R, 2=L, 3=Negative/Axis. HOME (PAD8) обрабатывается отдельно.
+const uint8_t PLR_SEQUENCES[2][7] PROGMEM = {
+  {0x00, 0x01, 0x02, 0x44, 0x48, 0x41, 0x49}, // P,R,L,PR,PL,RP,RL
+  {0x92, 0x89, 0x88, 0x44, 0x48, 0x03, 0x49}, // S,N,H,PR,PL,NEG,RL
+};
 
 const char *const NOTE_NAMES[12] = {
   "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
@@ -186,7 +193,8 @@ uint8_t  chordVoiceCount = CHORD_VOICES;
 uint8_t  chordSpread = SP_CLOSE;
 uint8_t  chordBank = 0;
 int8_t   chordRegister = 0;
-bool     chordVoiceLeading = true;
+uint8_t  chordVoiceLeading = VL_SMOOTH;
+bool     plrExtended = false;
 uint8_t  previousVoicing[CHORD_VOICES];
 uint8_t  previousVoiceCount = 0;
 // bit7 = minor, low nibble = root pitch class 0..11.
@@ -488,7 +496,8 @@ void setDefaultSettings() {
   chordSpread = SP_CLOSE;
   chordBank = 0;
   chordRegister = 0;
-  chordVoiceLeading = true;
+  chordVoiceLeading = VL_SMOOTH;
+  plrExtended = false;
   previousVoiceCount = 0;
   neoState = NEO_INVALID;
   loadScale(0);
@@ -1333,7 +1342,7 @@ uint8_t finishVoicing(int16_t *base, uint8_t count,
   const int16_t registerLimit = (int16_t)count * period / 2;
   bool found = false;
 
-  if (chordVoiceLeading && previousVoiceCount == count) {
+  if (chordVoiceLeading != VL_OFF && previousVoiceCount == count) {
     uint16_t bestMovement = 0xFFFF;
     int16_t candidate[CHORD_VOICES];
     memcpy(candidate, base, count * sizeof(candidate[0]));
@@ -1354,6 +1363,10 @@ uint8_t finishVoicing(int16_t *base, uint8_t count,
           const int16_t pitch = candidate[v] + delta;
           int16_t distance = pitch - previousVoicing[v];
           if (distance < 0) distance = -distance;
+          if ((chordVoiceLeading == VL_BASS && v == 0) ||
+              (chordVoiceLeading == VL_TOP && v + 1 == count)) {
+            distance *= 4;
+          }
           movement += (uint16_t)distance;
         }
         if (!found || movement < bestMovement) {
@@ -1470,6 +1483,7 @@ void applyNeoOperation(uint8_t operation) {
   if (operation == 0) minor = !minor;           // Parallel
   else if (operation == 1) { root += minor ? 3 : -3; minor = !minor; }
   else if (operation == 2) { root += minor ? -4 : 4; minor = !minor; }
+  else { root = 2 * rootPC - root; minor = !minor; } // Negative, tonic axis
   neoState = wrapPitchClass(root);
   if (minor) neoState |= 0x80;
 }
@@ -1492,10 +1506,12 @@ uint8_t buildPlrChord(uint8_t key, uint8_t *out) {
     previousVoiceCount = 0;  // HOME всегда даёт один канонический voicing
   } else {
     if (neoState == NEO_INVALID) resetNeoState();
-    const uint8_t sequence = pgm_read_byte(PLR_SEQUENCES + key);
-    applyNeoOperation(sequence & 0x0F);
-    const uint8_t second = sequence >> 4;
-    if (second < 3) applyNeoOperation(second);
+    uint8_t sequence = pgm_read_byte(&PLR_SEQUENCES[plrExtended][key]);
+    uint8_t count = (sequence >> 6) + 1;
+    do {
+      applyNeoOperation(sequence & 0x03);
+      sequence >>= 2;
+    } while (--count);
   }
   const int16_t root = 48 + (neoState & 0x0F) +
                        curScale.period * octOffset + 12 * chordRegister;
@@ -1567,8 +1583,12 @@ void onKeyChange(uint8_t idx, bool down) {
         *putU(putStr(b, "PROFILE "), (uint16_t)(chordProfile + 1)) = 0;
         setOverlay(b);
       } else if (j == 7) {
-        chordVoiceLeading = !chordVoiceLeading;
-        setOverlay(chordVoiceLeading ? "VOICE LEAD ON" : "VOICE LEAD OFF");
+        plrExtended = !plrExtended;
+        char b[6];
+        char *p = putStr(b, "PLR ");
+        *p++ = plrExtended ? 'E' : 'B';
+        *p = 0;
+        setOverlay(b);
       }
     }
   } else {
@@ -1758,7 +1778,7 @@ void updatePots() {
           uint8_t s = (uint8_t)(((uint32_t)f * N_SCALES) >> 10);
           if (s >= N_SCALES) s = N_SCALES - 1;
           if (s != scaleIdx) {
-            // Зоны 76 скейлов узкие — принимаем только глубже 3 отсчётов
+            // Зоны скейлов узкие — принимаем только глубже 3 отсчётов
             // от границы, чтобы шум АЦП не листал скейлы сам
             uint16_t lo = (uint16_t)(((uint32_t)s << 10) / N_SCALES);
             uint16_t hi =
@@ -1869,11 +1889,12 @@ void updatePots() {
             *putI(p, chordRegister) = 0;
             setOverlay(b);
           }
-        } else if (i == 7) {                    // POT8 = auto voice leading
-          const bool value = f >= 512;
+        } else if (i == 7) {                    // POT8 = VL personality
+          const uint8_t value = potZone(f, 4);
           if (value != chordVoiceLeading) {
             chordVoiceLeading = value;
-            setOverlay(value ? "VOICE LEAD ON" : "VOICE LEAD OFF");
+            *putU(putStr(b, "VL MODE "), value) = 0;
+            setOverlay(b);
           }
         }
         break;

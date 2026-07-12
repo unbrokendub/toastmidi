@@ -7,10 +7,10 @@
 
 ## Главное
 
-- 76 скейлов, включая два неоктавных Bohlen–Pierce с периодом 19 полутонов;
+- 84 скейла, включая два неоктавных Bohlen–Pierce с периодом 19 полутонов;
 - индивидуальная высота каждой из 8 кнопок через парный потенциометр;
 - раскладка переживает смену скейла без потери накрученных регистров;
-- 6 scale-профилей, 8 банков прогрессий, P/R/L и auto voice leading;
+- 6 scale-профилей, 8 банков прогрессий, две P/R/L-палитры и 4 VL personality;
 - 3–6 голосов, inversion, Close/Wide/Drop2/Drop3 и register ±2;
 - MIDI channel 1–16, velocity и переназначаемые CC1–CC127;
 - штатная радиопанель через запаянный nRF24L01+;
@@ -43,7 +43,7 @@ KEY8–POT7, KEY7–POT3, KEY3–POT8, KEY2–POT4. POT9 — VALUE.
 | POT1…8 | назначение высоты парной кнопки, слой по умолчанию |
 | POT9 | velocity 1…127 |
 | SHIFT + POT1…8 | MIDI CC, слой по умолчанию |
-| SHIFT + POT9 | выбор одного из 76 скейлов |
+| SHIFT + POT9 | выбор одного из 84 скейлов |
 | SHIFT + обе OCT | поменять местами NOTE/CC-слои до перезагрузки |
 
 Октавные кнопки срабатывают на отпускание. Как только обе подтверждены
@@ -68,7 +68,7 @@ KEY8–POT7, KEY7–POT3, KEY3–POT8, KEY2–POT4. POT9 — VALUE.
 | POT5 | Close / Wide / Drop2 / Drop3 |
 | POT6 | progression bank |
 | POT7 | chord register −2…+2 |
-| POT8 | auto voice leading OFF/ON |
+| POT8 | VL: 0 OFF / 1 SMOOTH / 2 BASS / 3 TOP |
 | POT9 | яркость OLED |
 
 После входа в новый режим каждый пот ждёт реального движения: старое
@@ -80,7 +80,7 @@ KEY8–POT7, KEY7–POT3, KEY3–POT8, KEY2–POT4. POT9 — VALUE.
 |---|---|
 | SHIFT + PAD1 | NOTES RESET |
 | SHIFT + PAD2…PAD7 | прямой выбор шести profiles |
-| SHIFT + PAD8 | voice leading OFF/ON |
+| SHIFT + PAD8 без OCT | палитра P/R/L: BASIC ↔ EXT |
 
 ## Относительная раскладка
 
@@ -98,6 +98,11 @@ KEY8–POT7, KEY7–POT3, KEY3–POT8, KEY2–POT4. POT9 — VALUE.
 
 Смена root транспонирует anchors вместе с тоникой. Глобальные OCT-кнопки
 используют `curScale.period`: 12 для обычных скейлов и 19 для Bohlen–Pierce.
+
+Последние восемь позиций селектора — новые скейлы: BEBOP DOR, BLUES BOTH,
+MIN6 PENTA, LYD AUG, LYD b3, LEAD WHOLE, HMIN PENTA и TODI 12T. Последний —
+12-TET-аппроксимация для экспериментов с drone, а не полная ладовая модель
+индийской раги.
 
 ## Harmony engine
 
@@ -133,27 +138,37 @@ Scale-profiles следуют периоду выбранного скейла. 
 
 ### P/R/L — обе OCT + PAD
 
-| PAD слева направо | Физический KEY | Операция |
-|---|---|---|
-| 1 | KEY6 | P (Parallel) |
-| 2 | KEY10 | R (Relative) |
-| 3 | KEY5 | L (Leading-tone exchange) |
-| 4 | KEY9 | P → R |
-| 5 | KEY8 | P → L |
-| 6 | KEY7 | R → P |
-| 7 | KEY3 | R → L |
-| 8 | KEY2 | HOME из текущего root/scale |
+| PAD слева направо | Физический KEY | BASIC | EXT |
+|---|---|---|---|
+| 1 | KEY6 | P (Parallel) | S (Slide) |
+| 2 | KEY10 | R (Relative) | N (Nebenverwandt) |
+| 3 | KEY5 | L (Leading-tone exchange) | H (Hexatonic Pole) |
+| 4 | KEY9 | P → R | P → R |
+| 5 | KEY8 | P → L | P → L |
+| 6 | KEY7 | R → P | NEG (root axis) |
+| 7 | KEY3 | R → L | R → L |
+| 8 | KEY2 | HOME | HOME |
+
+После включения активна BASIC. `SHIFT + PAD8` без OCT переключает палитру;
+это крайняя правая игровая кнопка, физический KEY2, а не кнопка с надписью
+KEY8. Переключение меняет только следующие операции и сохраняет текущую
+гармоническую точку. Составные операции выполняются слева направо.
 
 Примеры от C major: P → C minor, R → A minor, L → E minor. Последний
 progression chord становится seed для следующей P/R/L-операции. P/R/L state
 хранит pitch class, а не абсолютную MIDI-октаву; HOME дополнительно сбрасывает
 VL history и потому при повторных нажатиях всегда даёт один и тот же voicing.
+В EXT от C major: S → C# minor, N → F minor, H → Ab minor. NEG отражает
+текущую major/minor-триаду относительно оси выбранного root и меняет её лад.
 
 Auto voice leading перебирает обращения и соседние регистры, минимизируя
-суммарное движение голосов относительно последнего сыгранного аккорда.
+движение голосов относительно последнего сыгранного аккорда. SMOOTH считает
+все голоса одинаково, BASS в четыре раза сильнее удерживает нижний голос,
+TOP — верхний. Новая personality применяется к следующему аккорду и не
+перестраивает уже удерживаемый.
 История не зависит от held-note bookkeeping и сохраняется после отпускания.
-Изменение числа голосов начинает новую историю автоматически. При VL ON
-POT3 задаёт предпочтение при равном результате, а не принудительное
+Изменение числа голосов начинает новую историю автоматически. При любом VL
+кроме OFF POT3 задаёт предпочтение при равном результате, а не принудительное
 обращение; строгий inversion получается при VL OFF. Shell9 по определению
 остаётся четырёхголосным, даже если общий параметр VOICES равен 5 или 6.
 Voice leading рассматривает только обращения в окне вокруг заданного register,
@@ -216,7 +231,7 @@ pio run -e toast_firmware -t upload
 
 Проверенная конфигурация: SparkFun Pro Micro 5V/16 MHz, PlatformIO
 `atmelavr@5.3.0`. USB CDC специально не отключён. Размер v0.3 на текущем
-toolchain: 28 266 / 28 672 bytes flash (98,6%), 1 395 / 2 560 bytes static
+toolchain: 28 422 / 28 672 bytes flash (99,1%), 1 382 / 2 560 bytes static
 RAM; SSD1306 framebuffer ещё 512 bytes выделяет в heap при старте.
 
 Size flags находятся в `platformio.ini`: splash SSD1306 отключён,
