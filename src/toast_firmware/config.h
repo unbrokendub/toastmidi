@@ -14,13 +14,11 @@
 
 #define MIDI_CH 0            // стартовый MIDI-канал 0..15 (0 = «канал 1»)
 
-struct PotDef { uint8_t src; uint8_t chan; uint8_t cc; };
-struct KeyDef { uint8_t src; uint8_t chan; uint8_t activeLow; uint8_t note; };
-// src:  индекс в MUX_Z[]
-//       0xFF = аналоговый вход напрямую (chan = пин, например A3)
-//       0xFE = цифровой пин напрямую (chan = пин; при activeLow=1
-//              включается внутренняя подтяжка INPUT_PULLUP)
-// cc:   номер MIDI CC;  note: номер MIDI-ноты
+// Все органы этой конкретной платы сидят на 74HC4051. Упаковываем источник
+// (верхние 2 бита) и канал (нижние 3 бита) в один байт вместо RAM-структур.
+#define PACK_NODE(src, chan) (uint8_t)(((src) << 3) | (chan))
+#define NODE_SRC(node)       (uint8_t)((node) >> 3)
+#define NODE_CHAN(node)      (uint8_t)((node) & 0x07)
 
 // ---- Распиновка платы (вывод probe от 2026-07-11) ----
 
@@ -37,75 +35,76 @@ struct KeyDef { uint8_t src; uint8_t chan; uint8_t activeLow; uint8_t note; };
 
 static const uint8_t MUX_Z[] = {A0, A6, A8};
 
-static const PotDef POTS[] = {
-  // поле cc = стартовый CC-номер (меняется на лету: SHIFT+OCT-DOWN + пот)
-  {0, 0, 1},    // POT1  верхний ряд, крайний левый (R24)
-  {0, 5, 2},    // POT2  верхний ряд, у гнезда MIDI
-  {1, 6, 3},    // POT3  верхний ряд, третий (R13)
-  {1, 5, 4},    // POT4  верхний ряд, правый (R11)
-  {0, 6, 5},    // POT5  средний ряд, левый (R25)
-  {0, 7, 6},    // POT6  центр (R21)
-  {1, 0, 7},    // POT7  правее центра (R12)
-  {1, 7, 8},    // POT8  правый край (R10)
-  {1, 3, 0},    // POT9  правый нижний (R9) — селектор VALUE, CC не шлёт
+static const uint8_t POT_NODES[] PROGMEM = {
+  PACK_NODE(0, 0),  // POT1  верхний ряд, крайний левый (R24)
+  PACK_NODE(0, 5),  // POT2  верхний ряд, у гнезда MIDI
+  PACK_NODE(1, 6),  // POT3  верхний ряд, третий (R13)
+  PACK_NODE(1, 5),  // POT4  верхний ряд, правый (R11)
+  PACK_NODE(0, 6),  // POT5  средний ряд, левый (R25)
+  PACK_NODE(0, 7),  // POT6  центр (R21)
+  PACK_NODE(1, 0),  // POT7  правее центра (R12)
+  PACK_NODE(1, 7),  // POT8  правый край (R10)
+  PACK_NODE(1, 3),  // POT9  правый нижний (R9) — VALUE
 };
 
-static const KeyDef KEYS[] = {
-  // поле note в v0.2 не используется (роли кнопок — ниже)
-  {1, 1, 1, 36},  // KEY1  (подтверждено повторным прогоном зонда 11.07.2026)
-  {1, 2, 1, 37},  // KEY2
-  {1, 4, 1, 38},  // KEY3
-  {2, 2, 1, 39},  // KEY4
-  {2, 1, 1, 40},  // KEY5
-  {2, 3, 1, 41},  // KEY6
-  {2, 7, 1, 42},  // KEY7
-  {2, 5, 1, 43},  // KEY8
-  {2, 4, 1, 44},  // KEY9
-  {2, 0, 1, 45},  // KEY10
-  {2, 6, 1, 46},  // KEY11
+static const uint8_t KEY_NODES[] PROGMEM = {
+  PACK_NODE(1, 1),  // KEY1  (подтверждено повторным прогоном зонда 11.07.2026)
+  PACK_NODE(1, 2),  // KEY2
+  PACK_NODE(1, 4),  // KEY3
+  PACK_NODE(2, 2),  // KEY4
+  PACK_NODE(2, 1),  // KEY5
+  PACK_NODE(2, 3),  // KEY6
+  PACK_NODE(2, 7),  // KEY7
+  PACK_NODE(2, 5),  // KEY8
+  PACK_NODE(2, 4),  // KEY9
+  PACK_NODE(2, 0),  // KEY10
+  PACK_NODE(2, 6),  // KEY11
 };
 
-// ---- роли органов управления (v0.2 «скейл-клавиатура») ----
+// ---- роли органов управления (v0.3 harmony engine) ----
 // индексы = номер KEY/POT минус 1
 
 #define BTN_SHIFT     3      // KEY4  — шифт
 #define BTN_OCT_DOWN 10      // KEY11 — октава вниз (левый нижний угол)
 #define BTN_OCT_UP    0      // KEY1  — октава вверх (правый нижний угол)
 
-// игровые кнопки слева направо, как удобно играть:
-// KEY6, KEY10, KEY5, KEY9, KEY8, KEY7, KEY3, KEY2
-static const uint8_t NOTE_KEYS[8] = {5, 9, 4, 8, 7, 6, 2, 1};
+// KEY index -> игровая кнопка 0..7; 0xFF = служебная кнопка.
+// Игровой порядок: KEY6, KEY10, KEY5, KEY9, KEY8, KEY7, KEY3, KEY2.
+static const uint8_t KEY_TO_NOTE[] PROGMEM = {
+  0xFF, 7, 6, 0xFF, 2, 0, 5, 4, 3, 1, 0xFF
+};
 
-// пот, закреплённый за игровой кнопкой (для SHIFT+пот = нота кнопки):
-// KEY6-POT5, KEY10-POT1, KEY5-POT6, KEY9-POT2,
-// KEY8-POT7, KEY7-POT3,  KEY3-POT8, KEY2-POT4
-static const uint8_t KEY_POT[8] = {4, 0, 5, 1, 6, 2, 7, 3};
+// Пары вычисляются формулой в firmware: KEY6-POT5, KEY10-POT1,
+// KEY5-POT6, KEY9-POT2, KEY8-POT7, KEY7-POT3, KEY3-POT8, KEY2-POT4.
 
 #define POT_VALUE 8          // POT9 — селектор VALUE
 
-#define PIN_LED 6            // белый светодиод
+#define PIN_LED_R 5          // три ноги штатного RGB LED (active HIGH)
+#define PIN_LED_G 6
+#define PIN_LED_B 7
 
 #define NRF_CSN_PIN 9        // подтверждено (ce_pin/csn_pin из прошивки оригинала)
 #define NRF_CE_PIN  10       // CE=D10 (извлечён из прошивки; зонд ошибочно счёл «не подключён»)
-// ВНИМАНИЕ: D5/D6/D7 — RGB-светодиод (не одна нога!). PIN_LED=6 — одна из ног.
+// Цветовой порядок выведен из разводки; если ревизия платы меняет каналы,
+// достаточно переставить эти три define, логика прошивки не изменится.
 
 // ---- конец блока распиновки ----
 
 #define N_MUX  (sizeof(MUX_Z) / sizeof(MUX_Z[0]))
-#define N_POTS (sizeof(POTS) / sizeof(POTS[0]))
-#define N_KEYS (sizeof(KEYS) / sizeof(KEYS[0]))
-#define N_NOTE_KEYS (sizeof(NOTE_KEYS) / sizeof(NOTE_KEYS[0]))
+#define N_POTS (sizeof(POT_NODES) / sizeof(POT_NODES[0]))
+#define N_KEYS (sizeof(KEY_NODES) / sizeof(KEY_NODES[0]))
+#define N_NOTE_KEYS 8
 
 // ---- OLED ----
 #define OLED_HEIGHT 32       // штатный 0.91" OLED = 128x32
 #define OLED_ADDR 0x3C
 #define OLED_WIRE_TIMEOUT_US 3000UL
+#define OLED_PAGE_COUNT (OLED_HEIGHT / 8)
 
 // Не ставьте здесь 64 без отдельного аудита RAM: framebuffer 128x64 займёт
 // 1024 байта вместо 512 и оставит ATmega32U4 опасно мало памяти под стек.
-// 3 ms достаточно для одного 32-byte I2C chunk при 400 kHz. Полный refresh
-// состоит примерно из 17 chunks: при закороченной SDA задержка ограничится
-// десятками миллисекунд, после чего OLED отключится, а MIDI продолжит работу.
+// 3 ms достаточно для одного Wire chunk при 400 kHz. Sender отдаёт одну
+// 128-byte page за loop и прекращает кадр сразу после первого NACK/timeout.
 
 // ---- nRF24L01+: штатная беспроводная панель кнопок ----
 //
@@ -195,27 +194,14 @@ static const RadioButtonDef NRF_BUTTONS[NRF_BUTTON_COUNT] PROGMEM = {
 #define OLED_BRIGHTNESS_DEFAULT 255
 #define OLED_BRIGHTNESS_MIN 6
 
-// ---- аккорды (модификаторы октавных кнопок) ----
-// Октавные кнопки срабатывают на ОТПУСКАНИЕ (короткий тап = сдвиг октавы).
-// Если удерживать октаву-ВНИЗ и нажать нот-кнопку -> аккорд Set A.
-// Если удерживать октаву-ВВЕРХ и нажать нот-кнопку -> аккорд Set B.
-// Смещения заданы в СТУПЕНЯХ текущего скейла от ноты этой кнопки, поэтому
-// все аккорды всегда внутри скейла и звучат согласованно в любой тональности
-// и любом из 76 скейлов — их можно играть подряд, и это звучит слитно.
-// Голоса раскинуты по НЕСКОЛЬКИМ октавам — одна кнопка даёт большой,
-// «кинематографичный» аккорд. Ноты, вышедшие за MIDI 0..127, просто
-// отбрасываются (крайние голоса пропадают, диссонанса не будет).
-//   Set A (вниз)  = раскрытый maj9/min9: root-5-7-9-12-14  ≈ 2 октавы
-//   Set B (вверх) = квартовый эпик-стек: стопка кварт        ≈ 2.5 октавы
-// Смещения в ступенях скейла; 127 в слоте = «пропустить голос». Меняй свободно.
+// ---- harmony engine ----
 #define CHORD_VOICES 6
-static const int8_t CHORD_SET_A[CHORD_VOICES] = {0, 4, 6, 8, 11, 13};
-static const int8_t CHORD_SET_B[CHORD_VOICES] = {0, 3, 6, 9, 12, 15};
 
 // ---- сохранение пользовательских настроек ----
-// Первые 10 EEPROM-байт принципиально не трогаем по просьбе автора TOAST.
-// Запись начинается с byte 10, выполняется только спустя паузу после
-// последнего изменения и по одному байту за проход loop(). EEPROM.update()
-// дополнительно не перезаписывает ячейку, если значение уже совпадает.
+// По умолчанию runtime-настройки НЕ пишутся: прибор быстро настраивается,
+// EEPROM не изнашивается, а код writer/CRC не занимает flash. Официальные
+// radio IDs по 0x0208..0x0213 по-прежнему только читаются. Writer v3
+// сохранён для экспериментов, но ENABLE=1 требует нового size-аудита.
+#define ENABLE_SETTINGS_PERSISTENCE 0
 #define SETTINGS_EEPROM_START 10
-#define SETTINGS_SAVE_DELAY_MS 2000UL
+#define SETTINGS_SAVE_DELAY_MS 10000UL

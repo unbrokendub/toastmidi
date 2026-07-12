@@ -1,28 +1,34 @@
 /*
- * TOAST — кастомная прошивка v0.2 «скейл-клавиатура»
+ * TOAST — кастомная прошивка v0.3 «harmony engine»
  * SpaceMelodyLab TOAST v1.1 (Arduino Pro Micro / ATmega32U4)
  *
  * Управление:
  *   8 игровых кнопок       — ноты (полифония, аккорды работают)
- *   KEY11 / KEY1           — октава вниз / вверх
+ *   KEY11 / KEY1 tap       — period вниз / вверх
+ *   KEY11 / KEY1 + PAD     — profile / progression chord
+ *   обе октавы + PAD       — P/R/L harmony
  *   KEY4 (SHIFT) + POT9    — выбор скейла
- *   KEY4 + POT1..8         — нота закреплённой кнопки (внутри скейла)
+ *   POT1..8                — нота закреплённой кнопки (внутри скейла)
+ *   KEY4 + POT1..8         — MIDI CC (слои можно поменять местами)
  *   KEY4 + KEY11 + POT9    — MIDI-канал
  *   KEY4 + KEY11 + POT1..8 — CC-номер пота
  *   KEY4 + KEY1  + POT9    — яркость OLED
  *   KEY4 + KEY1  + POT1    — тоника (root) скейла
- *   POT1..8 без шифта      — MIDI CC (по умолчанию CC1..CC8)
+ *   KEY4 + KEY1 + POT2..8  — параметры harmony engine
  *
  * Все события идут в USB-MIDI и в DIN/TRS MIDI OUT одновременно.
  * OLED: клавиатура одной октавы + статус + подсказки действий.
  * Штатная радиопанель принимается через nRF24L01+ (это не BLE).
- * Настройки сохраняются в EEPROM отложенно, без записи первых 10 байт.
+ * Runtime-настройки по умолчанию живут только до перезагрузки; официальные
+ * radio IDs в EEPROM прошивка по-прежнему только читает.
  */
 
 #include <Arduino.h>
 #include <EEPROM.h>
 #include <Wire.h>
 #include <MIDIUSB.h>
+#include <USBAPI.h>
+#include <util/atomic.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "config.h"
@@ -34,6 +40,14 @@ bool nrfOk = false;
 
 Adafruit_SSD1306 display(128, OLED_HEIGHT, &Wire, -1);
 bool hasOled = false;
+constexpr uint8_t OLED_WIDTH_PX = 128;
+constexpr uint8_t OLED_DATA_PER_TX = BUFFER_LENGTH - 1;
+constexpr uint32_t OLED_I2C_HZ = 400000UL;
+static_assert(OLED_HEIGHT == 32 && OLED_PAGE_COUNT == 4,
+              "OLED page order expects 128x32");
+static_assert(BUFFER_LENGTH >= 8, "unexpectedly small Wire buffer");
+// 0..3 = transfer slot; 4 = idle. Порядок страниц 3,0,1,2 — status first.
+uint8_t oledTxSlot = OLED_PAGE_COUNT;
 
 // ================== скейлы ==================
 
@@ -44,85 +58,98 @@ struct ScaleDef {
   char name[11];
 };
 
-const ScaleDef SCALES[] PROGMEM = {
-  {12, 12, {0,1,2,3,4,5,6,7,8,9,10,11}, "CHROMATIC"},
-  {7,  12, {0,2,4,5,7,9,11},            "MAJOR"},
-  {7,  12, {0,2,3,5,7,8,10},            "MINOR"},
-  {7,  12, {0,2,3,5,7,8,11},            "HARM MINOR"},
-  {7,  12, {0,2,3,5,7,9,11},            "MEL MINOR"},
-  {7,  12, {0,2,3,5,7,9,10},            "DORIAN"},
-  {7,  12, {0,1,3,5,7,8,10},            "PHRYGIAN"},
-  {7,  12, {0,2,4,6,7,9,11},            "LYDIAN"},
-  {7,  12, {0,2,4,5,7,9,10},            "MIXOLYDIAN"},
-  {7,  12, {0,1,3,5,6,8,10},            "LOCRIAN"},
-  {5,  12, {0,2,4,7,9},                 "PENTA MAJ"},
-  {5,  12, {0,3,5,7,10},                "PENTA MIN"},
-  {6,  12, {0,3,5,6,7,10},              "BLUES MIN"},
-  {6,  12, {0,2,3,4,7,9},               "BLUES MAJ"},
-  {6,  12, {0,2,4,6,8,10},              "WHOLE TONE"},
-  {8,  12, {0,2,3,5,6,8,9,11},          "DIM W-H"},
-  {8,  12, {0,1,3,4,6,7,9,10},          "DIM H-W"},
-  {7,  12, {0,1,4,5,7,8,10},            "PHRYG DOM"},
-  {7,  12, {0,2,3,6,7,8,11},            "HUNGAR MIN"},
-  {7,  12, {0,1,4,5,7,8,11},            "DBL HARMON"},
-  {5,  12, {0,2,3,7,8},                 "HIRAJOSHI"},
-  {5,  12, {0,1,5,7,10},                "IN SEN"},
-  {5,  12, {0,1,5,6,10},                "IWATO"},
-  {5,  12, {0,2,5,7,9},                 "YO"},
-  {7,  12, {0,2,4,5,7,8,11},            "HARM MAJOR"},
-  {7,  12, {0,2,4,6,7,9,10},            "LYDIAN DOM"},
-  {7,  12, {0,1,3,4,6,8,10},            "ALTERED"},
-  {7,  12, {0,2,3,5,6,8,10},            "LOCRIAN #2"},
-  {7,  12, {0,2,4,5,7,8,10},            "MIXOLYD b6"},
-  {7,  12, {0,1,3,5,7,9,10},            "DORIAN b2"},
-  {8,  12, {0,2,4,5,7,9,10,11},         "BEBOP DOM"},
-  {8,  12, {0,2,4,5,7,8,9,11},          "BEBOP MAJ"},
-  {7,  12, {0,1,3,5,7,8,11},            "NEAPOL MIN"},
-  {7,  12, {0,1,3,5,7,9,11},            "NEAPOL MAJ"},
-  {7,  12, {0,1,4,6,8,10,11},           "ENIGMATIC"},
-  {6,  12, {0,2,4,6,9,10},              "PROMETHEUS"},
-  {6,  12, {0,3,4,7,8,11},              "AUGMENTED"},
-  {6,  12, {0,1,4,6,7,10},              "TRITONE"},
-  {7,  12, {0,1,4,5,6,8,11},            "PERSIAN"},
-  {7,  12, {0,3,4,6,7,9,10},            "HUNGAR MAJ"},
-  {7,  12, {0,2,3,6,7,9,10},            "ROMANIAN"},
-  {5,  12, {0,2,5,7,10},                "EGYPTIAN"},
-  {5,  12, {0,2,3,7,9},                 "KUMOI"},
-  {5,  12, {0,1,3,7,8},                 "PELOG"},
-  {9,  12, {0,2,3,4,6,7,8,10,11},       "MESSIAEN 3"},
-  {8,  12, {0,1,2,5,6,7,8,11},          "MESSIAEN 4"},
-  {6,  12, {0,1,5,6,7,11},              "MESSIAEN 5"},
-  {8,  12, {0,2,4,5,6,8,10,11},         "MESSIAEN 6"},
-  {10, 12, {0,1,2,3,5,6,7,8,9,11},      "MESSIAEN 7"},
-  {9,  19, {0,3,4,7,9,12,13,16,18},     "BP LAMBDA"},
-  {13, 19, {0,1,3,4,6,7,9,10,12,13,15,16,18}, "BP CHROMA"},
-  {8,  12, {0,2,4,6,7,8,10,11},         "HARMONICS"},
-  {9,  12, {0,1,3,4,5,7,8,9,11},        "TCHEREPNIN"},
-  {6,  12, {0,3,5,6,7,11},              "BLUES MM7"},
-  {7,  12, {0,3,5,6,7,9,10},            "BLUES HEPT"},
-  {6,  12, {0,1,3,4,7,9},               "BLUES DHEX"},
-  {7,  12, {0,2,3,5,6,7,10},            "BLUES MOD"},
-  {8,  12, {0,2,3,5,6,7,9,10},          "BLUES OCT"},
-  {7,  12, {0,1,3,5,6,7,10},            "BLUES PHRY"},
-  {7,  12, {0,1,2,5,7,8,9},             "CHROM DOR"},
-  {7,  12, {0,3,4,5,8,10,11},           "CHROM PHRY"},
-  {7,  12, {0,1,3,4,6,8,9},             "ULTRA LOCR"},
-  {8,  12, {0,2,3,5,6,7,8,11},          "ALGERIAN"},
-  {7,  12, {0,1,4,5,6,9,10},            "ORIENTAL"},
-  {8,  12, {0,1,4,5,6,8,10,11},         "ENIGMA 8"},
-  {7,  12, {0,1,3,6,8,10,11},           "ENIGMA MIN"},
-  {7,  12, {0,1,4,5,7,9,10},            "BHAIRAV"},
-  {6,  12, {0,1,3,5,8,10},              "RITSU"},
-  {7,  12, {0,1,4,6,7,8,11},            "PURAVI bVI"},
-  {7,  12, {0,2,5,6,8,9,11},            "NOHKAN"},
-  {8,  12, {0,1,3,4,5,7,8,10},          "FLAMENCO"},
-  {8,  12, {0,2,3,5,6,8,10,11},         "SCHWARZ 42"},
-  {7,  12, {0,1,4,5,7,9,11},            "BHAIRUBAHR"},
-  {8,  12, {0,1,2,3,5,7,9,10},          "ADONAI MLK"},
-  {8,  12, {0,2,3,5,7,8,9,11},          "ZIRAFKEND"},
-  {8,  12, {0,2,3,5,7,8,10,11},         "UTIL MINOR"},
+constexpr uint8_t N_SCALES = 76;
+constexpr uint8_t SCALE_BP_LAMBDA = 49;
+constexpr uint8_t SCALE_BP_CHROMA = 50;
+
+// Для обычных скейлов bit N означает наличие полутона N. Нулевые маски
+// зарезервированы за двумя BP-скейлами, у которых период равен 19.
+const uint16_t SCALE_MASKS[N_SCALES] PROGMEM = {
+  0x0FFF, 0x0AB5, 0x05AD, 0x09AD, 0x0AAD, 0x06AD, 0x05AB, 0x0AD5,
+  0x06B5, 0x056B, 0x0295, 0x04A9, 0x04E9, 0x029D, 0x0555, 0x0B6D,
+  0x06DB, 0x05B3, 0x09CD, 0x09B3, 0x018D, 0x04A3, 0x0463, 0x02A5,
+  0x09B5, 0x06D5, 0x055B, 0x056D, 0x05B5, 0x06AB, 0x0EB5, 0x0BB5,
+  0x09AB, 0x0AAB, 0x0D53, 0x0655, 0x0999, 0x04D3, 0x0973, 0x06D9,
+  0x06CD, 0x04A5, 0x028D, 0x018B, 0x0DDD, 0x09E7, 0x08E3, 0x0D75,
+  0x0BEF, 0x0000, 0x0000, 0x0DD5, 0x0BBB, 0x08E9, 0x06E9, 0x029B,
+  0x04ED, 0x06ED, 0x04EB, 0x03A7, 0x0D39, 0x035B, 0x09ED, 0x0673,
+  0x0D73, 0x0D4B, 0x06B3, 0x052B, 0x09D3, 0x0B65, 0x05BB, 0x0D6D,
+  0x0AB3, 0x06AF, 0x0BAD, 0x0DAD,
 };
-#define N_SCALES (sizeof(SCALES) / sizeof(SCALES[0]))
+
+const uint8_t BP_LAMBDA_DEGREES[9] PROGMEM =
+    {0, 3, 4, 7, 9, 12, 13, 16, 18};
+const uint8_t BP_CHROMA_DEGREES[13] PROGMEM =
+    {0, 1, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18};
+
+// Null-packed вместо [76][11]: полный текст имён без 110 padding bytes.
+// Scale меняется редко, поэтому линейный проход по flash дешевле offsets table.
+const char SCALE_NAMES[] PROGMEM =
+  "CHROMATIC\0MAJOR\0MINOR\0HARM MINOR\0MEL MINOR\0DORIAN\0"
+  "PHRYGIAN\0LYDIAN\0MIXOLYDIAN\0LOCRIAN\0PENTA MAJ\0PENTA MIN\0"
+  "BLUES MIN\0BLUES MAJ\0WHOLE TONE\0DIM W-H\0DIM H-W\0PHRYG DOM\0"
+  "HUNGAR MIN\0DBL HARMON\0HIRAJOSHI\0IN SEN\0IWATO\0YO\0"
+  "HARM MAJOR\0LYDIAN DOM\0ALTERED\0LOCRIAN #2\0MIXOLYD b6\0"
+  "DORIAN b2\0BEBOP DOM\0BEBOP MAJ\0NEAPOL MIN\0NEAPOL MAJ\0"
+  "ENIGMATIC\0PROMETHEUS\0AUGMENTED\0TRITONE\0PERSIAN\0HUNGAR MAJ\0"
+  "ROMANIAN\0EGYPTIAN\0KUMOI\0PELOG\0MESSIAEN 3\0MESSIAEN 4\0"
+  "MESSIAEN 5\0MESSIAEN 6\0MESSIAEN 7\0BP LAMBDA\0BP CHROMA\0"
+  "HARMONICS\0TCHEREPNIN\0BLUES MM7\0BLUES HEPT\0BLUES DHEX\0"
+  "BLUES MOD\0BLUES OCT\0BLUES PHRY\0CHROM DOR\0CHROM PHRY\0"
+  "ULTRA LOCR\0ALGERIAN\0ORIENTAL\0ENIGMA 8\0ENIGMA MIN\0BHAIRAV\0"
+  "RITSU\0PURAVI bVI\0NOHKAN\0FLAMENCO\0SCHWARZ 42\0BHAIRUBAHR\0"
+  "ADONAI MLK\0ZIRAFKEND\0UTIL MINOR";
+
+// ================== harmony data ==================
+
+enum ChordQuality : uint8_t {
+  Q_MAJ, Q_MIN, Q_DOM7, Q_MAJ7, Q_MIN7, Q_DIM, Q_HDIM7, Q_AUG
+};
+enum ChordSpread : uint8_t { SP_CLOSE, SP_WIDE, SP_DROP2, SP_DROP3 };
+
+constexpr uint8_t CHORD_PROFILE_COUNT = 6;
+constexpr uint8_t CHORD_BANK_COUNT = 8;
+constexpr uint8_t CHORD_SKIP = 0xFF;
+constexpr uint8_t NEO_INVALID = 0xFF;
+
+const uint8_t CHORD_PROFILES[CHORD_PROFILE_COUNT][CHORD_VOICES] PROGMEM = {
+  {0, 4, 6, 9, 11, 15},                       // Wide 9
+  {0, 4, 7, 9, 11, 14},                       // Open
+  {0, 2, 4, 6, 8, 12},                        // 13 no 11
+  {0, 2, 6, 8, CHORD_SKIP, CHORD_SKIP},       // Shell 9
+  {0, 3, 6, 9, 12, 15},                       // Quartal
+  {0, 4, 8, 12, 16, 20},                      // Quintal
+};
+
+const uint16_t QUALITY_MASKS[8] PROGMEM = {
+  0x091, 0x089, 0x491, 0x891, 0x489, 0x049, 0x449, 0x111
+};
+
+#define CHORD_DESC(rootOffset, quality) \
+  (uint8_t)(((uint8_t)(quality) << 4) | (uint8_t)(rootOffset))
+const uint8_t PROGRESSION_BANKS[CHORD_BANK_COUNT][N_NOTE_KEYS] PROGMEM = {
+  {CHORD_DESC(0,Q_MAJ), CHORD_DESC(7,Q_MAJ), CHORD_DESC(9,Q_MIN), CHORD_DESC(5,Q_MAJ),
+   CHORD_DESC(0,Q_MAJ), CHORD_DESC(7,Q_MAJ), CHORD_DESC(9,Q_MIN), CHORD_DESC(5,Q_MAJ)},
+  {CHORD_DESC(2,Q_MIN7), CHORD_DESC(7,Q_DOM7), CHORD_DESC(0,Q_MAJ7), CHORD_DESC(9,Q_MIN7),
+   CHORD_DESC(2,Q_MIN7), CHORD_DESC(7,Q_DOM7), CHORD_DESC(0,Q_MAJ7), CHORD_DESC(9,Q_MIN7)},
+  {CHORD_DESC(0,Q_MAJ), CHORD_DESC(5,Q_MAJ), CHORD_DESC(5,Q_MIN), CHORD_DESC(0,Q_MAJ),
+   CHORD_DESC(0,Q_MAJ), CHORD_DESC(5,Q_MAJ), CHORD_DESC(5,Q_MIN), CHORD_DESC(0,Q_MAJ)},
+  {CHORD_DESC(10,Q_MAJ), CHORD_DESC(5,Q_MAJ), CHORD_DESC(0,Q_MAJ), CHORD_DESC(10,Q_MAJ),
+   CHORD_DESC(5,Q_MAJ), CHORD_DESC(0,Q_MAJ), CHORD_DESC(10,Q_MAJ), CHORD_DESC(0,Q_MAJ)},
+  {CHORD_DESC(0,Q_MIN), CHORD_DESC(10,Q_MAJ), CHORD_DESC(8,Q_MAJ), CHORD_DESC(10,Q_MAJ),
+   CHORD_DESC(0,Q_MIN), CHORD_DESC(10,Q_MAJ), CHORD_DESC(8,Q_MAJ), CHORD_DESC(10,Q_MAJ)},
+  {CHORD_DESC(8,Q_MAJ), CHORD_DESC(10,Q_MAJ), CHORD_DESC(0,Q_MAJ), CHORD_DESC(8,Q_MAJ),
+   CHORD_DESC(10,Q_MAJ), CHORD_DESC(0,Q_MAJ), CHORD_DESC(10,Q_MAJ), CHORD_DESC(0,Q_MAJ)},
+  {CHORD_DESC(0,Q_MIN), CHORD_DESC(5,Q_MAJ), CHORD_DESC(0,Q_MIN), CHORD_DESC(5,Q_MAJ),
+   CHORD_DESC(0,Q_MIN), CHORD_DESC(5,Q_MAJ), CHORD_DESC(0,Q_MIN), CHORD_DESC(5,Q_MAJ)},
+  {CHORD_DESC(0,Q_MAJ), CHORD_DESC(4,Q_MAJ), CHORD_DESC(8,Q_MAJ), CHORD_DESC(0,Q_MAJ),
+   CHORD_DESC(0,Q_MAJ), CHORD_DESC(4,Q_MAJ), CHORD_DESC(8,Q_MAJ), CHORD_DESC(0,Q_MAJ)},
+};
+#undef CHORD_DESC
+
+// Low nibble first, high nibble second. 0=P, 1=R, 2=L, 0xF=stop.
+const uint8_t PLR_SEQUENCES[7] PROGMEM =
+    {0xF0, 0xF1, 0xF2, 0x10, 0x20, 0x01, 0x21};
 
 const char *const NOTE_NAMES[12] = {
   "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
@@ -137,11 +164,14 @@ uint8_t  scaleIdx  = 0;
 uint8_t  rootPC    = 0;         // тоника 0..11 (C..B)
 int8_t   octOffset = 0;         // глобальный сдвиг октав (-3..+3)
 uint8_t  midiCh    = MIDI_CH;   // 0..15
-int16_t  ladderMin = 0;         // первый индекс лестницы, дающий MIDI note >= 0
-int16_t  ladderMax = 127;       // последний индекс лестницы, дающий note <= 127
-int16_t  keyLadder[N_NOTE_KEYS]; // позиция каждой игровой кнопки в лестнице
+int8_t   ladderMin = 0;         // первый индекс лестницы, дающий MIDI note >= 0
+int8_t   ladderMax = 127;       // последний индекс лестницы, дающий note <= 127
+int8_t   keyLadder[N_NOTE_KEYS]; // вычисленный индекс ступени текущего скейла
+// Каноническое намерение пользователя: высота кнопки без octOffset,
+// относительно rootPC. При смене скейла эти anchors не меняются, поэтому
+// накрученные индивидуальные октавы точно возвращаются вместе со скейлом.
+int8_t   keyRelSemitone[N_NOTE_KEYS];
 uint8_t  potCCnum[N_POTS];       // CC-номер каждого пота
-int8_t   potToKey[N_POTS];       // обратная карта: пот -> игровая кнопка
 
 Mode     mode = M_PLAY;
 bool     swapLayers = true;     // true: поты без шифта крутят ноты, CC — под шифтом
@@ -149,6 +179,18 @@ bool     comboLatched = false;  // защёлка комбо SHIFT+обе окт
 int8_t   previewNote = -1;      // нота, выбираемая потом — подсветка на пиано
 uint8_t  velocity = KEY_VELOCITY;  // velocity нот, крутится value-потом в игре
 uint8_t  oledBrightness = OLED_BRIGHTNESS_DEFAULT;  // контраст SSD1306 0..255
+
+uint8_t  chordProfile = 0;
+uint8_t  chordInversion = 0;
+uint8_t  chordVoiceCount = CHORD_VOICES;
+uint8_t  chordSpread = SP_CLOSE;
+uint8_t  chordBank = 0;
+int8_t   chordRegister = 0;
+bool     chordVoiceLeading = true;
+uint8_t  previousVoicing[CHORD_VOICES];
+uint8_t  previousVoiceCount = 0;
+// bit7 = minor, bits0..6 = MIDI root 24..95.
+uint8_t  neoState = NEO_INVALID;
 
 uint16_t potFilt[N_POTS];
 uint16_t potLatch[N_POTS];
@@ -174,8 +216,9 @@ HeldNotes sounding[N_NOTE_KEYS];
 // Октавные кнопки срабатывают на ОТПУСКАНИЕ (тап = сдвиг октавы), а удержание
 // служит модификатором аккордов. Флаг помечает, что удержание уже «потрачено»
 // на аккорд или режим, и тогда на отпускании октава не сдвигается.
-// [0] = октава вниз (Set A), [1] = октава вверх (Set B).
+// [0] = OCT-down/profile, [1] = OCT-up/progression; вместе = P/R/L.
 bool octConsumed[2] = {false, false};
+uint8_t dispatchOctMask = 0;      // включает OCT, отпущенные в том же scan
 
 #if ENABLE_NRF_RX
 // Радиокнопка является самостоятельным источником: она может удерживаться
@@ -190,17 +233,17 @@ uint8_t  keypadId[NRF_PANEL_COUNT][6];
 bool     keypadIdValid[NRF_PANEL_COUNT];
 #endif
 
-bool     usbDirty  = false;
 bool     dispDirty = true;
 uint32_t ledOffAt = 0, dispLastDraw = 0, overlayUntil = 0;
 char     overlay[22] = "";
-char     lastEvent[22] = "TOAST v0.2";
+char     lastEvent[22] = "TOAST v0.3";
 
-// ================== отложенное EEPROM ==================
+// ================== опциональное EEPROM ==================
 
+#if ENABLE_SETTINGS_PERSISTENCE
 // На little-endian AVR эти четыре байта лежат как ASCII "TMD1".
 constexpr uint32_t SETTINGS_MAGIC = 0x31444D54UL;
-constexpr uint8_t SETTINGS_VERSION = 2;  // v2: добавлено поле brightness
+constexpr uint8_t SETTINGS_VERSION = 3;  // v3: relative anchors + int8 cache
 constexpr uint8_t SETTINGS_FLAG_SWAP_LAYERS = 0x01;
 
 struct __attribute__((packed)) StoredSettings {
@@ -215,7 +258,8 @@ struct __attribute__((packed)) StoredSettings {
   uint8_t flags;
   uint8_t brightness;
   uint8_t potCc[N_POTS];
-  int16_t keyStep[N_NOTE_KEYS];
+  int8_t keyRel[N_NOTE_KEYS];
+  int8_t keyStep[N_NOTE_KEYS];
   uint16_t crc;
 };
 
@@ -225,14 +269,16 @@ bool settingsWriteActive = false;
 uint8_t settingsWritePos = 0;
 uint32_t settingsChangedAt = 0;
 
-static_assert(N_KEYS <= 16, "key change mask is 16 bit");
-static_assert(N_NOTE_KEYS == 8, "UI and radio mapping expect eight note keys");
-static_assert(POT_VALUE < N_POTS, "POT_VALUE must index POTS");
 static_assert(sizeof(StoredSettings) <= 255, "EEPROM writer uses an 8-bit index");
 static_assert(SETTINGS_EEPROM_START >= 10, "first ten EEPROM bytes are reserved");
 static_assert(SETTINGS_EEPROM_START + sizeof(StoredSettings) <=
                   NRF_EEPROM_KEYPAD_1,
               "custom settings must not overlap official keypad IDs");
+#endif
+
+static_assert(N_KEYS <= 16, "key change mask is 16 bit");
+static_assert(N_NOTE_KEYS == 8, "UI and radio mapping expect eight note keys");
+static_assert(POT_VALUE < N_POTS, "POT_VALUE must index POT_NODES");
 
 // ================== утилиты ==================
 
@@ -277,38 +323,122 @@ int16_t ladderNote(int16_t k) {
 }
 
 uint8_t playedNote(uint8_t j) {               // с учётом сдвига октав
-  int16_t n = ladderNote(keyLadder[j]) + 12 * octOffset;
-  while (n > 127) n -= 12;
-  while (n < 0) n += 12;
+  int16_t n = ladderNote(keyLadder[j]) + curScale.period * octOffset;
+  while (n > 127) n -= curScale.period;
+  while (n < 0) n += curScale.period;
   return (uint8_t)n;
 }
 
 void resetLadder() {                          // кнопки = первые 8 ступеней от ~C3
   int16_t base = curScale.len * (60 / curScale.period);
-  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) keyLadder[j] = base + j;
+  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
+    keyLadder[j] = (int8_t)(base + j);
+    keyRelSemitone[j] = (int8_t)(ladderNote(keyLadder[j]) - rootPC);
+  }
 }
 
-void setScale(uint8_t s) {
+void updateLadderBounds() {
+  int16_t k = 0;
+  while (ladderNote(k) >= 0) k--;
+  ladderMin = (int8_t)(k + 1);
+  k = 0;
+  while (ladderNote(k + 1) <= 127) k++;
+  ladderMax = (int8_t)k;
+}
+
+void loadScale(uint8_t s) {
   scaleIdx = s;
-  memcpy_P(&curScale, &SCALES[s], sizeof(ScaleDef));
-
-  // Ищем полный валидный диапазон индексов, включая отрицательные.
-  // Благодаря этому, например, скейл с root D может назначить C#/ниже D,
-  // если эта высота действительно входит в выбранный набор ступеней.
-  ladderMin = 0;
-  while (ladderNote(ladderMin) >= 0) ladderMin--;
-  ladderMin++;
-  ladderMax = 0;
-  while (ladderNote(ladderMax + 1) <= 127) ladderMax++;
-
-  // Назначения кнопок СОХРАНЯЕМ при смене скейла/тоники: держим ту же
-  // ступень-индекс каждой кнопки (в новом скейле она озвучится по-новому),
-  // только подрезаем в допустимый диапазон. Полный сброс к дефолту делает
-  // отдельно resetLadder() — при старте defaults и по комбо NOTES RESET.
-  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
-    if (keyLadder[j] < ladderMin) keyLadder[j] = ladderMin;
-    else if (keyLadder[j] > ladderMax) keyLadder[j] = ladderMax;
+  memset(&curScale, 0, sizeof(curScale));
+  PGM_P name = SCALE_NAMES;
+  for (uint8_t i = 0; i < s; i++) {
+    while (pgm_read_byte(name++)) {}
   }
+  for (uint8_t i = 0; i < sizeof(curScale.name) - 1; i++) {
+    const char c = (char)pgm_read_byte(name++);
+    curScale.name[i] = c;
+    if (!c) break;
+  }
+  if (s == SCALE_BP_LAMBDA || s == SCALE_BP_CHROMA) {
+    const bool chroma = s == SCALE_BP_CHROMA;
+    curScale.len = chroma ? 13 : 9;
+    curScale.period = 19;
+    memcpy_P(curScale.deg,
+             chroma ? BP_CHROMA_DEGREES : BP_LAMBDA_DEGREES,
+             curScale.len);
+  } else {
+    curScale.period = 12;
+    const uint16_t mask = pgm_read_word(SCALE_MASKS + s);
+    for (uint8_t pc = 0; pc < 12; pc++) {
+      if (mask & ((uint16_t)1 << pc)) curScale.deg[curScale.len++] = pc;
+    }
+  }
+  updateLadderBounds();
+}
+
+// Найти ближайшую доступную ступень к сохранённой высоте. При точной ничьей
+// сохраняем фазу старой лестницы: Eb minor -> E major, а не D major.
+int8_t resolveLadder(int16_t target, int8_t oldK, uint8_t oldLen) {
+  int16_t lo = ladderMin, hi = ladderMax;
+  while (lo < hi) {
+    const int16_t mid = (lo + hi) / 2;
+    if (ladderNote(mid) < target) lo = mid + 1;
+    else hi = mid;
+  }
+  const int8_t upper = (int8_t)lo;
+  if (upper == ladderMin) return upper;
+  const int8_t lower = (int8_t)(upper - 1);
+  int16_t lowerDistance = target - ladderNote(lower);
+  if (lowerDistance < 0) lowerDistance = -lowerDistance;
+  int16_t upperDistance = ladderNote(upper) - target;
+  if (upperDistance < 0) upperDistance = -upperDistance;
+  if (lowerDistance != upperDistance) {
+    return lowerDistance < upperDistance ? lower : upper;
+  }
+  int16_t lowerPhase = (int16_t)(lower * oldLen - oldK * curScale.len);
+  int16_t upperPhase = (int16_t)(upper * oldLen - oldK * curScale.len);
+  if (lowerPhase < 0) lowerPhase = -lowerPhase;
+  if (upperPhase < 0) upperPhase = -upperPhase;
+  return lowerPhase <= upperPhase ? lower : upper;
+}
+
+void resolveKeyLayout(const int8_t *oldSteps, uint8_t oldLen) {
+  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
+    const int16_t target = rootPC + keyRelSemitone[j];
+    keyLadder[j] = resolveLadder(target, oldSteps[j], oldLen);
+  }
+}
+
+void changeScale(uint8_t s) {
+  int8_t oldSteps[N_NOTE_KEYS];
+  memcpy(oldSteps, keyLadder, sizeof(oldSteps));
+  const uint8_t oldLen = curScale.len;
+  loadScale(s);
+  resolveKeyLayout(oldSteps, oldLen);
+  neoState = NEO_INVALID;
+}
+
+void changeRoot(uint8_t r) {
+  int8_t oldSteps[N_NOTE_KEYS];
+  memcpy(oldSteps, keyLadder, sizeof(oldSteps));
+  rootPC = r;
+  updateLadderBounds();
+  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
+    int16_t step = oldSteps[j];
+    int16_t relative = ladderNote(step) - rootPC;
+    const uint8_t halfPeriod = curScale.period / 2;
+    while (relative + halfPeriod < keyRelSemitone[j]) {
+      step += curScale.len;
+      relative += curScale.period;
+    }
+    while (relative - halfPeriod > keyRelSemitone[j]) {
+      step -= curScale.len;
+      relative -= curScale.period;
+    }
+    while (step < ladderMin) step += curScale.len;
+    while (step > ladderMax) step -= curScale.len;
+    keyLadder[j] = (int8_t)step;
+  }
+  neoState = NEO_INVALID;
 }
 
 void setOverlay(const char *s) {
@@ -319,6 +449,11 @@ void setOverlay(const char *s) {
   dispDirty = true;
 }
 
+uint8_t potZone(uint16_t value, uint8_t zones) {
+  uint8_t zone = (uint8_t)(((uint32_t)value * zones) >> 10);
+  return zone < zones ? zone : (uint8_t)(zones - 1);
+}
+
 bool heldEmpty(const HeldNotes &h) {
   for (uint8_t v = 0; v < CHORD_VOICES; v++) {
     if (h.note[v] != NO_NOTE) return false;
@@ -326,6 +461,7 @@ bool heldEmpty(const HeldNotes &h) {
   return true;
 }
 
+#if ENABLE_SETTINGS_PERSISTENCE
 bool anyNotesHeld() {
   for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
     if (!heldEmpty(sounding[j])) return true;
@@ -337,7 +473,32 @@ bool anyNotesHeld() {
 #endif
   return false;
 }
+#endif
 
+void setDefaultSettings() {
+  rootPC = 0;
+  octOffset = 0;
+  midiCh = MIDI_CH;
+  velocity = KEY_VELOCITY;
+  swapLayers = true;
+  oledBrightness = OLED_BRIGHTNESS_DEFAULT;
+  chordProfile = 0;
+  chordInversion = 0;
+  chordVoiceCount = CHORD_VOICES;
+  chordSpread = SP_CLOSE;
+  chordBank = 0;
+  chordRegister = 0;
+  chordVoiceLeading = true;
+  previousVoiceCount = 0;
+  neoState = NEO_INVALID;
+  loadScale(0);
+  resetLadder();
+  for (uint8_t i = 0; i < N_POTS; i++) {
+    potCCnum[i] = (i == POT_VALUE) ? 0 : (uint8_t)(i + 1);
+  }
+}
+
+#if ENABLE_SETTINGS_PERSISTENCE
 // CRC делает оборванную запись безопасной: если питание исчезло в середине
 // отложенного сохранения, на следующем старте блок не будет принят частично.
 uint16_t settingsCrc(const StoredSettings &value) {
@@ -351,18 +512,6 @@ uint16_t settingsCrc(const StoredSettings &value) {
     }
   }
   return crc;
-}
-
-void setDefaultSettings() {
-  rootPC = 0;
-  octOffset = 0;
-  midiCh = MIDI_CH;
-  velocity = KEY_VELOCITY;
-  swapLayers = true;              // по умолчанию поты крутят НОТЫ, CC — под шифтом
-  oledBrightness = OLED_BRIGHTNESS_DEFAULT;
-  setScale(0);
-  resetLadder();                  // дефолтная раскладка кнопок (setScale её не трогает)
-  for (uint8_t i = 0; i < N_POTS; i++) potCCnum[i] = POTS[i].cc;
 }
 
 bool storedHeaderValid(const StoredSettings &saved) {
@@ -394,9 +543,10 @@ void loadSettings() {
   if (!storedHeaderValid(saved)) return;
 
   rootPC = saved.root;
-  setScale(saved.scale);  // одновременно пересчитывает ladderMin/ladderMax
+  loadScale(saved.scale);
   for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
-    if (saved.keyStep[j] < ladderMin || saved.keyStep[j] > ladderMax) {
+    if (saved.keyRel[j] < -11 ||
+        saved.keyStep[j] < ladderMin || saved.keyStep[j] > ladderMax) {
       setDefaultSettings();
       return;
     }
@@ -411,7 +561,10 @@ void loadSettings() {
   oledBrightness = saved.brightness;
   if (oledBrightness < OLED_BRIGHTNESS_MIN) oledBrightness = OLED_BRIGHTNESS_MIN;
   for (uint8_t i = 0; i < N_POTS; i++) potCCnum[i] = saved.potCc[i];
-  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) keyLadder[j] = saved.keyStep[j];
+  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
+    keyRelSemitone[j] = saved.keyRel[j];
+    keyLadder[j] = saved.keyStep[j];
+  }
 }
 
 void snapshotSettings() {
@@ -428,6 +581,7 @@ void snapshotSettings() {
   pendingSettings.brightness = oledBrightness;
   for (uint8_t i = 0; i < N_POTS; i++) pendingSettings.potCc[i] = potCCnum[i];
   for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
+    pendingSettings.keyRel[j] = keyRelSemitone[j];
     pendingSettings.keyStep[j] = keyLadder[j];
   }
   pendingSettings.crc = settingsCrc(pendingSettings);
@@ -475,14 +629,15 @@ void settingsTask() {
   settingsWritePos = 0;
   settingsWriteActive = true;
 }
+#else
+void loadSettings() { setDefaultSettings(); }
+void markSettingsDirty() {}
+void settingsTask() {}
+#endif
 
 // ================== чтение входов ==================
 
 uint16_t readNode(uint8_t src, uint8_t chan) {
-  uint8_t pin;
-  if (src == 0xFF || src == 0xFE) {
-    pin = chan;
-  } else {
 #if USE_FAST_PORTF_MUX && defined(__AVR_ATmega32U4__)
     static_assert(MUX_S0 == A1 && MUX_S1 == A2 && MUX_S2 == A3,
                   "fast PORTF mapping requires S0=A1, S1=A2, S2=A3");
@@ -502,23 +657,177 @@ uint16_t readNode(uint8_t src, uint8_t chan) {
     digitalWrite(MUX_S2, (chan >> 2) & 1);
 #endif
 
-    // После переключения 74HC4051 даём аналоговому узлу установиться.
-    // Первый analogRead ниже намеренно выбрасывается: он заряжает sample &
-    // hold ADC от нового источника, второй уже используется как измерение.
-    delayMicroseconds(50);
-    pin = MUX_Z[src];
-  }
+  // После переключения 74HC4051 даём аналоговому узлу установиться.
+  // Первый analogRead ниже намеренно выбрасывается: он заряжает sample &
+  // hold ADC от нового источника, второй уже используется как измерение.
+  delayMicroseconds(50);
+  const uint8_t pin = MUX_Z[src];
   analogRead(pin);
   return (uint16_t)analogRead(pin);
 }
 
+uint16_t readPackedNode(const uint8_t *nodes, uint8_t index) {
+  const uint8_t node = pgm_read_byte(nodes + index);
+  return readNode(NODE_SRC(node), NODE_CHAN(node));
+}
+
+uint8_t potForKey(uint8_t key) {
+  return (uint8_t)((key >> 1) + ((key & 1) ? 0 : 4));
+}
+
+int8_t keyForPot(uint8_t pot) {
+  if (pot >= N_NOTE_KEYS) return -1;
+  return (pot < 4) ? (int8_t)(pot * 2 + 1)
+                   : (int8_t)((pot - 4) * 2);
+}
+
 // ================== отправка MIDI ==================
 
-void ledFlash() {
-  if (PIN_LED >= 0) {
-    digitalWrite(PIN_LED, HIGH);
-    ledOffAt = millis() + 25;
+namespace UsbMidiTx {
+constexpr uint8_t TX_EP = CDC_FIRST_ENDPOINT + CDC_ENPOINT_COUNT + 1;
+constexpr uint8_t Q_CAP = 16;
+constexpr uint8_t Q_MASK = Q_CAP - 1;
+static_assert(TX_EP == 5, "MIDIUSB endpoint mapping changed");
+static_assert(TX_EP < USB_ENDPOINTS, "not enough AVR USB endpoints");
+static_assert((Q_CAP & Q_MASK) == 0, "USB MIDI queue must be power of two");
+static_assert(sizeof(midiEventPacket_t) == 4, "unexpected USB MIDI packet");
+
+midiEventPacket_t queue[Q_CAP];
+uint8_t head = 0, tail = 0, count = 0;
+bool desynced = false;
+uint8_t panicStep = 0;  // CC120 по одному разу на каждый MIDI channel
+
+void task();
+
+void flushNonblocking() {
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { MidiUSB.flush(); }
+}
+
+void clearQueue() { head = tail = count = 0; }
+
+void enterRecovery() {
+  clearQueue();
+  desynced = true;
+  panicStep = 0;
+}
+
+bool enqueue(const midiEventPacket_t &packet, bool replacePendingCc) {
+  if (!USBDevice.configured() || desynced) return false;
+
+  if (replacePendingCc) {
+    for (uint8_t i = 0; i < count; i++) {
+      midiEventPacket_t &old = queue[(tail + i) & Q_MASK];
+      if (old.byte1 == packet.byte1 && old.byte2 == packet.byte2) {
+        old = packet;
+        return true;
+      }
+    }
   }
+
+  if (count == Q_CAP) task();
+  if (!USBDevice.configured() || desynced) return false;
+  if (count == Q_CAP) {
+    // После восстановления host снимем все потенциально зависшие ноты.
+    enterRecovery();
+    return false;
+  }
+  queue[head] = packet;
+  head = (head + 1) & Q_MASK;
+  count++;
+  return true;
+}
+
+void enqueueNote(uint8_t channel, uint8_t note, bool on, uint8_t noteVelocity) {
+  const uint8_t status = (uint8_t)((on ? 0x90 : 0x80) | (channel & 0x0F));
+  const midiEventPacket_t packet = {
+    (uint8_t)(on ? 0x09 : 0x08), status, note,
+    (uint8_t)(on ? noteVelocity : 0)
+  };
+  enqueue(packet, false);
+}
+
+void enqueueCC(uint8_t channel, uint8_t cc, uint8_t value, bool continuous) {
+  const uint8_t status = (uint8_t)(0xB0 | (channel & 0x0F));
+  const midiEventPacket_t packet = {0x0B, status, cc, value};
+  enqueue(packet, continuous);
+}
+
+void task() {
+  if (!USBDevice.configured()) {
+    clearQueue();
+    desynced = false;
+    panicStep = 0;
+    return;
+  }
+
+  uint8_t space = USB_SendSpace(TX_EP);
+  if (space && space < 8) {
+    flushNonblocking();
+  }
+
+  bool wrote = false;
+  uint8_t budget = 15;  // максимум 60 из 64 bytes: без ZLP/wait path
+  if (desynced) {
+    while (panicStep < 16 && budget && USB_SendSpace(TX_EP) >= 8) {
+      const uint8_t channel = panicStep & 0x0F;
+      const midiEventPacket_t packet = {
+        0x0B, (uint8_t)(0xB0 | channel), 120, 0
+      };
+      MidiUSB.sendMIDI(packet);
+      panicStep++;
+      budget--;
+      wrote = true;
+    }
+    if (wrote) flushNonblocking();
+    if (panicStep == 16) {
+      desynced = false;
+      panicStep = 0;
+    }
+    return;
+  }
+
+  while (count && budget && USB_SendSpace(TX_EP) >= 8) {
+    MidiUSB.sendMIDI(queue[tail]);
+    tail = (tail + 1) & Q_MASK;
+    count--;
+    budget--;
+    wrote = true;
+  }
+  if (wrote) flushNonblocking();
+}
+}  // namespace UsbMidiTx
+
+enum LedColor : uint8_t {
+  LED_OFF = 0, LED_RED = 1, LED_GREEN = 2, LED_BLUE = 4,
+  LED_YELLOW = LED_RED | LED_GREEN,
+  LED_MAGENTA = LED_RED | LED_BLUE,
+  LED_CYAN = LED_GREEN | LED_BLUE,
+  LED_WHITE = LED_RED | LED_GREEN | LED_BLUE
+};
+
+uint8_t ledBaseColor = LED_GREEN;
+
+void rgbWrite(uint8_t color) {
+  digitalWrite(PIN_LED_R, color & LED_RED ? HIGH : LOW);
+  digitalWrite(PIN_LED_G, color & LED_GREEN ? HIGH : LOW);
+  digitalWrite(PIN_LED_B, color & LED_BLUE ? HIGH : LOW);
+}
+
+void updateLedBase() {
+#if ENABLE_NRF_RX
+  if (!nrfOk) ledBaseColor = LED_RED;
+  else
+#endif
+  if (mode == M_SETUP) ledBaseColor = LED_MAGENTA;
+  else if (mode == M_ROOT) ledBaseColor = LED_BLUE;
+  else if (mode == M_SHIFT) ledBaseColor = LED_YELLOW;
+  else ledBaseColor = swapLayers ? LED_GREEN : LED_CYAN;
+  if (!ledOffAt) rgbWrite(ledBaseColor);
+}
+
+void ledFlash() {
+  rgbWrite(LED_WHITE);
+  ledOffAt = millis() + 25;
 }
 
 void dinWrite3(uint8_t a, uint8_t b, uint8_t c) {
@@ -527,16 +836,12 @@ void dinWrite3(uint8_t a, uint8_t b, uint8_t c) {
   Serial1.write(c);
 }
 
-void sendCCOnChannel(uint8_t channel, uint8_t cc, uint8_t val) {
+void sendCCOnChannel(uint8_t channel, uint8_t cc, uint8_t val,
+                     bool continuous = false) {
   const uint8_t status = (uint8_t)(0xB0 | channel);
-
-  // DIN идёт первым намеренно. USB host иногда долго не забирает endpoint;
-  // MidiUSB.sendMIDI() в таком случае может ждать, но физический MIDI OUT
-  // уже получит событие и не будет зависеть от поведения компьютера.
+  // Полный DIN event всегда уходит до любого обращения к USB.
   dinWrite3(status, cc, val);
-  midiEventPacket_t p = {0x0B, status, cc, val};
-  MidiUSB.sendMIDI(p);
-  usbDirty = true;
+  UsbMidiTx::enqueueCC(channel, cc, val, continuous);
   ledFlash();
   char *q = putStr(lastEvent, "CC");
   q = putU(q, cc);
@@ -547,22 +852,25 @@ void sendCCOnChannel(uint8_t channel, uint8_t cc, uint8_t val) {
 }
 
 void sendCC(uint8_t cc, uint8_t val) {
-  sendCCOnChannel(midiCh, cc, val);
+  sendCCOnChannel(midiCh, cc, val, true);
 }
 
-void sendNoteEvent(uint8_t channel, uint8_t note, bool on) {
+void sendNoteBatch(uint8_t channel, const uint8_t *notes, uint8_t count,
+                   bool on) {
   const uint8_t status = (uint8_t)((on ? 0x90 : 0x80) | channel);
-  const uint8_t vel = on ? velocity : 0;
-
-  dinWrite3(status, note, vel);
-  midiEventPacket_t p = {(uint8_t)(on ? 0x09 : 0x08), status, note, vel};
-  MidiUSB.sendMIDI(p);
-  usbDirty = true;
-  ledFlash();
-  if (on) {
-    fmtNote(lastEvent, note);
+  const uint8_t noteVelocity = on ? velocity : 0;
+  // Критическое правило: сначала ВСЯ пачка DIN, затем только USB queue.
+  for (uint8_t i = 0; i < count; i++) {
+    dinWrite3(status, notes[i], noteVelocity);
   }
-  dispDirty = true;
+  for (uint8_t i = 0; i < count; i++) {
+    UsbMidiTx::enqueueNote(channel, notes[i], on, noteVelocity);
+  }
+  if (count) {
+    ledFlash();
+    if (on) fmtNote(lastEvent, notes[0]);
+    dispDirty = true;
+  }
 }
 
 bool sourceHoldsNote(const HeldNotes &h, uint8_t note, uint8_t channel) {
@@ -595,16 +903,26 @@ bool anotherSourceHolds(uint8_t note, uint8_t channel,
 void pressNoteSet(HeldNotes &held, const uint8_t *notes, uint8_t count) {
   if (!heldEmpty(held)) return;                 // источник уже держит что-то
   held.channel = midiCh;
-  for (uint8_t v = 0; v < CHORD_VOICES; v++) {
-    held.note[v] = (v < count) ? notes[v] : NO_NOTE;
+  uint8_t stored = 0;
+  for (uint8_t v = 0; v < count && v < CHORD_VOICES; v++) {
+    bool duplicate = false;
+    for (uint8_t k = 0; k < stored; k++) {
+      if (held.note[k] == notes[v]) duplicate = true;
+    }
+    if (!duplicate) held.note[stored++] = notes[v];
   }
+  for (uint8_t v = stored; v < CHORD_VOICES; v++) held.note[v] = NO_NOTE;
+
   // Note On шлём только для нот, которых не держит другой источник, чтобы
   // повторной высоты не было. ignore=&held: собственные ноты не считаем.
-  for (uint8_t v = 0; v < count; v++) {
+  uint8_t send[CHORD_VOICES];
+  uint8_t sendCount = 0;
+  for (uint8_t v = 0; v < stored; v++) {
     if (!anotherSourceHolds(held.note[v], held.channel, &held)) {
-      sendNoteEvent(held.channel, held.note[v], true);
+      send[sendCount++] = held.note[v];
     }
   }
+  sendNoteBatch(held.channel, send, sendCount, true);
 }
 
 void pressNoteSource(HeldNotes &held, uint8_t note) {
@@ -613,14 +931,17 @@ void pressNoteSource(HeldNotes &held, uint8_t note) {
 
 void releaseNoteSource(HeldNotes &held) {
   const uint8_t channel = held.channel;
+  uint8_t released[CHORD_VOICES];
+  uint8_t releasedCount = 0;
   for (uint8_t v = 0; v < CHORD_VOICES; v++) {
     const uint8_t note = held.note[v];
     if (note == NO_NOTE) continue;
     held.note[v] = NO_NOTE;                      // очищаем ДО проверки dedup
     if (!anotherSourceHolds(note, channel, nullptr)) {
-      sendNoteEvent(channel, note, false);
+      released[releasedCount++] = note;
     }
   }
+  sendNoteBatch(channel, released, releasedCount, false);
 }
 
 // ================== штатная радиопанель ==================
@@ -936,24 +1257,248 @@ void radioTask() {
 // ================== кнопки ==================
 
 int8_t noteKeyIndexOf(uint8_t keyIdx) {
-  for (uint8_t j = 0; j < N_NOTE_KEYS; j++)
-    if (NOTE_KEYS[j] == keyIdx) return (int8_t)j;
-  return -1;
+  const uint8_t note = pgm_read_byte(KEY_TO_NOTE + keyIdx);
+  return note == 0xFF ? -1 : (int8_t)note;
 }
 
-// Собрать аккорд для игровой кнопки j по таблице смещений в ступенях скейла.
-// Все голоса берутся из текущего скейла, поэтому любой аккорд в тональности.
-// Смещение 127 (0x7F) в слоте пропускает голос. Возвращает число нот.
-uint8_t buildChord(uint8_t j, const int8_t *offsets, uint8_t *out) {
-  const int16_t baseK = keyLadder[j];
-  uint8_t n = 0;
-  for (uint8_t v = 0; v < CHORD_VOICES; v++) {
-    if (offsets[v] == 127) continue;
-    int16_t note = ladderNote(baseK + offsets[v]) + 12 * octOffset;
-    if (note < 0 || note > 127) continue;    // крайний голос отбрасываем, не «складываем»
-    out[n++] = (uint8_t)note;
+void sortNotes16(int16_t *notes, uint8_t count) {
+  for (uint8_t i = 1; i < count; i++) {
+    const int16_t value = notes[i];
+    uint8_t k = i;
+    while (k && notes[k - 1] > value) {
+      notes[k] = notes[k - 1];
+      k--;
+    }
+    notes[k] = value;
   }
-  return n;
+}
+
+void shiftVoicing(int16_t *notes, uint8_t count, int16_t delta) {
+  for (uint8_t i = 0; i < count; i++) notes[i] += delta;
+}
+
+// В MIDI range переносится весь voicing целиком. Ни один крайний голос не
+// отбрасывается, поэтому Note On/Off и фактура всегда сохраняют размер.
+bool fitWholeVoicing(int16_t *notes, uint8_t count, uint8_t period) {
+  if (!count || !period) return false;
+  sortNotes16(notes, count);
+  if (notes[count - 1] - notes[0] > 127) return false;
+  while (notes[count - 1] > 127) shiftVoicing(notes, count, -(int16_t)period);
+  while (notes[0] < 0) shiftVoicing(notes, count, period);
+  return notes[count - 1] <= 127;
+}
+
+void rotateLowestVoice(int16_t *notes, uint8_t count, uint8_t period) {
+  int16_t moved = notes[0];
+  const int16_t top = notes[count - 1];
+  do moved += period; while (moved <= top);
+  for (uint8_t i = 1; i < count; i++) notes[i - 1] = notes[i];
+  notes[count - 1] = moved;
+}
+
+bool noteCollides(const int16_t *notes, uint8_t count, uint8_t index) {
+  for (uint8_t i = 0; i < count; i++) {
+    if (i != index && notes[i] == notes[index]) return true;
+  }
+  return false;
+}
+
+void applyChordSpread(int16_t *notes, uint8_t count, uint8_t period) {
+  sortNotes16(notes, count);
+  if (chordSpread == SP_WIDE) {
+    for (uint8_t i = count / 2; i < count; i++) notes[i] += period;
+  } else if (count >= 4 &&
+             (chordSpread == SP_DROP2 || chordSpread == SP_DROP3)) {
+    const uint8_t index = chordSpread == SP_DROP2 ? count - 2 : count - 3;
+    do notes[index] -= period;
+    while (noteCollides(notes, count, index));
+  }
+  sortNotes16(notes, count);
+}
+
+uint8_t finishVoicing(int16_t *base, uint8_t count,
+                      uint8_t period, uint8_t *out) {
+  if (!count || count > CHORD_VOICES || !period) return 0;
+  sortNotes16(base, count);
+  applyChordSpread(base, count, period);
+  if (!fitWholeVoicing(base, count, period)) return 0;
+  uint8_t preferred = chordInversion;
+  while (preferred >= count) preferred -= count;
+  bool found = false;
+
+  if (chordVoiceLeading && previousVoiceCount == count) {
+    uint16_t bestMovement = 0xFFFF;
+    int16_t candidate[CHORD_VOICES];
+    memcpy(candidate, base, count * sizeof(candidate[0]));
+    for (uint8_t r = 0; r < preferred; r++) {
+      rotateLowestVoice(candidate, count, period);
+    }
+    for (uint8_t k = 0; k < count; k++) {
+      if (!fitWholeVoicing(candidate, count, period)) continue;
+      for (int8_t reg = -2; reg <= 2; reg++) {
+        const int16_t delta = (int16_t)reg * period;
+        if (candidate[0] + delta < 0 ||
+            candidate[count - 1] + delta > 127) continue;
+        uint16_t movement = 0;
+        for (uint8_t v = 0; v < count; v++) {
+          const int16_t pitch = candidate[v] + delta;
+          int16_t distance = pitch - previousVoicing[v];
+          if (distance < 0) distance = -distance;
+          movement += (uint16_t)distance;
+        }
+        if (!found || movement < bestMovement) {
+          found = true;
+          bestMovement = movement;
+          for (uint8_t v = 0; v < count; v++) {
+            out[v] = (uint8_t)(candidate[v] + delta);
+          }
+        }
+      }
+      rotateLowestVoice(candidate, count, period);
+    }
+  }
+
+  if (!found) {
+    for (uint8_t r = 0; r < preferred; r++) {
+      rotateLowestVoice(base, count, period);
+    }
+    if (!fitWholeVoicing(base, count, period)) return 0;
+    for (uint8_t v = 0; v < count; v++) out[v] = (uint8_t)base[v];
+  }
+  memcpy(previousVoicing, out, count);
+  previousVoiceCount = count;
+  return count;
+}
+
+uint8_t countMaskTones(uint16_t mask) {
+  uint8_t count = 0;
+  for (uint8_t pc = 0; pc < 12; pc++) {
+    if (mask & ((uint16_t)1 << pc)) count++;
+  }
+  return count;
+}
+
+uint8_t maskToneAt(uint16_t mask, uint8_t wanted) {
+  for (uint8_t pc = 0; pc < 12; pc++) {
+    if (!(mask & ((uint16_t)1 << pc))) continue;
+    if (!wanted) return pc;
+    wanted--;
+  }
+  return 0;
+}
+
+uint8_t buildScaleProfileChord(uint8_t key, uint8_t *out) {
+  const uint8_t profile = chordProfile < CHORD_PROFILE_COUNT ? chordProfile : 0;
+  uint8_t limit = chordVoiceCount;
+  if (limit < 3) limit = 3;
+  if (limit > CHORD_VOICES) limit = CHORD_VOICES;
+  const int16_t registerShift =
+      (int16_t)curScale.period * (octOffset + chordRegister);
+  int16_t work[CHORD_VOICES];
+  uint8_t count = 0;
+  for (uint8_t slot = 0; slot < CHORD_VOICES && count < limit; slot++) {
+    const uint8_t offset = pgm_read_byte(&CHORD_PROFILES[profile][slot]);
+    if (offset != CHORD_SKIP) {
+      work[count++] = ladderNote(keyLadder[key] + offset) + registerShift;
+    }
+  }
+  return finishVoicing(work, count, curScale.period, out);
+}
+
+uint8_t buildQualityChord(int16_t root, uint8_t quality, uint8_t *out) {
+  if (quality > Q_AUG) return 0;
+  const uint16_t mask = pgm_read_word(&QUALITY_MASKS[quality]);
+  const uint8_t toneCount = countMaskTones(mask);
+  uint8_t target = chordVoiceCount;
+  if (target < 3) target = 3;
+  if (target > CHORD_VOICES) target = CHORD_VOICES;
+  int16_t work[CHORD_VOICES];
+  if (target == 3 && toneCount == 4) {
+    work[0] = root + maskToneAt(mask, 0);
+    work[1] = root + maskToneAt(mask, 1);
+    work[2] = root + maskToneAt(mask, 3);       // root, third, seventh
+  } else {
+    uint8_t ordinal = 0;
+    int16_t octave = 0;
+    for (uint8_t v = 0; v < target; v++) {
+      work[v] = root + maskToneAt(mask, ordinal) + octave;
+      if (++ordinal == toneCount) { ordinal = 0; octave += 12; }
+    }
+  }
+  return finishVoicing(work, target, 12, out);
+}
+
+uint8_t foldNeoRoot(int16_t root) {
+  while (root < 24) root += 12;
+  while (root > 95) root -= 12;
+  return (uint8_t)root;
+}
+
+bool homeScaleIsMinor() {
+  bool minorThird = false, majorThird = false;
+  for (uint8_t i = 0; i < curScale.len; i++) {
+    if (curScale.deg[i] == 3) minorThird = true;
+    if (curScale.deg[i] == 4) majorThird = true;
+  }
+  return minorThird && !majorThird;
+}
+
+void resetNeoState() {
+  const int16_t root = 48 + rootPC + curScale.period * octOffset +
+                       12 * chordRegister;
+  neoState = foldNeoRoot(root);
+  if (homeScaleIsMinor()) neoState |= 0x80;
+}
+
+void seedNeoFromQuality(int16_t root, uint8_t quality) {
+  bool minor;
+  if (quality == Q_MIN || quality == Q_MIN7) minor = true;
+  else if (quality == Q_MAJ || quality == Q_MAJ7 || quality == Q_DOM7) minor = false;
+  else return;
+  neoState = foldNeoRoot(root);
+  if (minor) neoState |= 0x80;
+}
+
+void applyNeoOperation(uint8_t operation) {
+  if (neoState == NEO_INVALID) resetNeoState();
+  int16_t root = neoState & 0x7F;
+  bool minor = neoState & 0x80;
+  if (operation == 0) minor = !minor;           // Parallel
+  else if (operation == 1) { root += minor ? 3 : -3; minor = !minor; }
+  else if (operation == 2) { root += minor ? -4 : 4; minor = !minor; }
+  neoState = foldNeoRoot(root);
+  if (minor) neoState |= 0x80;
+}
+
+uint8_t buildProgressionChord(uint8_t key, uint8_t *out) {
+  const uint8_t bank = chordBank < CHORD_BANK_COUNT ? chordBank : 0;
+  const uint8_t descriptor = pgm_read_byte(&PROGRESSION_BANKS[bank][key]);
+  const uint8_t quality = descriptor >> 4;
+  const int16_t root = 48 + rootPC + (descriptor & 0x0F) +
+                       curScale.period * octOffset + 12 * chordRegister;
+  const uint8_t count = buildQualityChord(root, quality, out);
+  if (count) seedNeoFromQuality(root, quality);
+  return count;
+}
+
+uint8_t buildPlrChord(uint8_t key, uint8_t *out) {
+  if (key == 7) resetNeoState();
+  else {
+    if (neoState == NEO_INVALID) resetNeoState();
+    const uint8_t sequence = pgm_read_byte(PLR_SEQUENCES + key);
+    applyNeoOperation(sequence & 0x0F);
+    const uint8_t second = sequence >> 4;
+    if (second < 3) applyNeoOperation(second);
+  }
+  return buildQualityChord(neoState & 0x7F,
+                           neoState & 0x80 ? Q_MIN : Q_MAJ, out);
+}
+
+uint8_t buildHarmonyChord(uint8_t key, uint8_t octMask, uint8_t *out) {
+  if (octMask == 1) return buildScaleProfileChord(key, out);
+  if (octMask == 2) return buildProgressionChord(key, out);
+  if (octMask == 3) return buildPlrChord(key, out);
+  return 0;
 }
 
 void latchNoteAssignmentPots();
@@ -971,6 +1516,8 @@ void onKeyChange(uint8_t idx, bool down) {
       const int8_t nextOctave = (int8_t)(octOffset + delta);
       if (nextOctave >= -3 && nextOctave <= 3) {
         octOffset = nextOctave;
+        previousVoiceCount = 0;
+        neoState = NEO_INVALID;
         markSettingsDirty();
       }
       char b[16];
@@ -988,25 +1535,32 @@ void onKeyChange(uint8_t idx, bool down) {
 
   if (down) {
     if (mode == M_PLAY) {
-      // Удержание октавной кнопки без шифта превращает нот-кнопку в аккорд.
-      const bool chordDown = !keyState[BTN_SHIFT] && keyState[BTN_OCT_DOWN];
-      const bool chordUp = !keyState[BTN_SHIFT] && keyState[BTN_OCT_UP];
-      if (chordDown || chordUp) {
-        octConsumed[chordDown ? 0 : 1] = true;   // октаву «потратили» на аккорд
+      const uint8_t octMask = dispatchOctMask;
+      if (octMask) {
+        if (octMask & 1) octConsumed[0] = true;
+        if (octMask & 2) octConsumed[1] = true;
         uint8_t chord[CHORD_VOICES];
-        const uint8_t n =
-            buildChord((uint8_t)j, chordDown ? CHORD_SET_A : CHORD_SET_B, chord);
+        const uint8_t n = buildHarmonyChord((uint8_t)j, octMask, chord);
         pressNoteSet(sounding[j], chord, n);
       } else {
         pressNoteSource(sounding[j], playedNote((uint8_t)j));
       }
-    } else if (mode == M_SHIFT && j == 0) {      // SHIFT + первая кнопка
-      resetLadder();
-      // Уже активированные note-поты не должны на следующем loop молча
-      // вернуть старые назначения. После reset их надо снова сдвинуть.
-      if (!swapLayers) latchNoteAssignmentPots();
-      markSettingsDirty();
-      setOverlay("NOTES RESET");
+    } else if (mode == M_SHIFT) {
+      if (j == 0) {
+        resetLadder();
+        previousVoiceCount = 0;
+        if (!swapLayers) latchNoteAssignmentPots();
+        markSettingsDirty();
+        setOverlay("NOTES RESET");
+      } else if (j <= CHORD_PROFILE_COUNT) {
+        chordProfile = (uint8_t)(j - 1);
+        char b[14];
+        *putU(putStr(b, "PROFILE "), (uint16_t)(chordProfile + 1)) = 0;
+        setOverlay(b);
+      } else if (j == 7) {
+        chordVoiceLeading = !chordVoiceLeading;
+        setOverlay(chordVoiceLeading ? "VOICE LEAD ON" : "VOICE LEAD OFF");
+      }
     }
   } else {
     releaseNoteSource(sounding[j]);              // note-off отдаём всегда
@@ -1016,14 +1570,7 @@ void onKeyChange(uint8_t idx, bool down) {
 uint16_t scanKeys() {
   uint16_t changed = 0;
   for (uint8_t i = 0; i < N_KEYS; i++) {
-    bool pressed;
-    if (KEYS[i].src == 0xFE) {
-      bool lvl = digitalRead(KEYS[i].chan);
-      pressed = KEYS[i].activeLow ? !lvl : lvl;
-    } else {
-      uint16_t v = readNode(KEYS[i].src, KEYS[i].chan);
-      pressed = KEYS[i].activeLow ? (v < 340) : (v > 680);
-    }
+    const bool pressed = readPackedNode(KEY_NODES, i) < 340;
     if (pressed != keyRead[i]) {
       keyRead[i] = pressed;
       keyT[i] = millis();
@@ -1037,6 +1584,18 @@ uint16_t scanKeys() {
 }
 
 void dispatchKeyChanges(uint16_t changed) {
+  dispatchOctMask =
+      (keyState[BTN_OCT_DOWN] ? 1 : 0) |
+      (keyState[BTN_OCT_UP] ? 2 : 0);
+  // PAD press обрабатывается раньше release-pass. Сохраняем в effective mask
+  // модификатор, который завершил debounce-release в том же самом scan.
+  if ((changed & ((uint16_t)1 << BTN_OCT_DOWN)) && !keyState[BTN_OCT_DOWN]) {
+    dispatchOctMask |= 1;
+  }
+  if ((changed & ((uint16_t)1 << BTN_OCT_UP)) && !keyState[BTN_OCT_UP]) {
+    dispatchOctMask |= 2;
+  }
+
   // Свежее нажатие октавной кнопки обнуляет флаг «потрачено» — но ДО раздачи
   // нот в этом же скане, иначе аккорд (индекс нот-кнопки может быть меньше)
   // затёрся бы поздним обработчиком октавы. Шифт при нажатии = сразу режим.
@@ -1045,6 +1604,10 @@ void dispatchKeyChanges(uint16_t changed) {
   }
   if ((changed & ((uint16_t)1 << BTN_OCT_UP)) && keyState[BTN_OCT_UP]) {
     octConsumed[1] = keyState[BTN_SHIFT];
+  }
+  if (keyState[BTN_OCT_DOWN] && keyState[BTN_OCT_UP]) {
+    octConsumed[0] = true;
+    octConsumed[1] = true;
   }
 
   // Сначала все нажатия, затем отпускания. Если в одном скане одна кнопка
@@ -1073,7 +1636,7 @@ void latchNoteAssignmentPots() {
   // Перевооружаем только восемь потов назначения нот. VALUE и возможные
   // будущие непарные контроллеры не должны побочно менять своё поведение.
   for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
-    const uint8_t i = KEY_POT[j];
+    const uint8_t i = potForKey(j);
     potLatch[i] = potFilt[i];
     potArmed[i] = false;
   }
@@ -1089,6 +1652,7 @@ void updateMode() {
     latchPots();
     // слой не сохраняем — переключение действует только до перезагрузки
     setOverlay(swapLayers ? "POTS = NOTES" : "POTS = CC");
+    updateLedBase();
   } else if (!combo) {
     comboLatched = false;
   }
@@ -1103,6 +1667,7 @@ void updateMode() {
     mode = m;
     latchPots();
     dispDirty = true;
+    updateLedBase();
   }
 }
 
@@ -1124,8 +1689,10 @@ void assignKeyNote(uint8_t j, uint16_t filt) {
       (uint16_t)(((uint32_t)filt * ladderSize) >> 10);
   int16_t k = (int16_t)(ladderMin + (int16_t)ladderOffset);
   if (k > ladderMax) k = ladderMax;
-  if (k == keyLadder[j]) return;
-  keyLadder[j] = k;
+  const int8_t rel = (int8_t)(ladderNote(k) - rootPC);
+  if (k == keyLadder[j] && rel == keyRelSemitone[j]) return;
+  keyLadder[j] = (int8_t)k;
+  keyRelSemitone[j] = rel;
   markSettingsDirty();
   char b[20], nm[5];
   uint8_t pn = playedNote(j);
@@ -1141,7 +1708,7 @@ void assignKeyNote(uint8_t j, uint16_t filt) {
 
 void updatePots() {
   for (uint8_t i = 0; i < N_POTS; i++) {
-    uint16_t raw = readNode(POTS[i].src, POTS[i].chan);
+    uint16_t raw = readPackedNode(POT_NODES, i);
     // Максимально резкий EMA, но фильтр остаётся: 7/8 нового + 1/8 старого.
     // Реагирует почти мгновенно (за ~1.5 чтения), но одиночные выбросы АЦП
     // всё же пригашиваются. В покое дребезг ловит дедбэнд POT_SEND_THRESHOLD.
@@ -1170,7 +1737,8 @@ void updatePots() {
           break;
         }
         if (swapLayers) {
-          if (potToKey[i] >= 0) assignKeyNote((uint8_t)potToKey[i], f);
+          const int8_t j = keyForPot(i);
+          if (j >= 0) assignKeyNote((uint8_t)j, f);
         } else {
           potSendCC(i, f);
         }
@@ -1187,7 +1755,7 @@ void updatePots() {
             uint16_t hi =
                 (uint16_t)(((uint32_t)(s + 1) << 10) / N_SCALES);
             if (f >= lo + 3 && f + 3 < hi) {
-              setScale(s);
+              changeScale(s);
               if (!swapLayers) latchNoteAssignmentPots();
               markSettingsDirty();
               setOverlay(curScale.name);
@@ -1195,8 +1763,9 @@ void updatePots() {
           }
         } else if (swapLayers) {
           potSendCC(i, f);
-        } else if (potToKey[i] >= 0) {
-          assignKeyNote((uint8_t)potToKey[i], f);
+        } else {
+          const int8_t j = keyForPot(i);
+          if (j >= 0) assignKeyNote((uint8_t)j, f);
         }
         break;
 
@@ -1239,12 +1808,63 @@ void updatePots() {
           uint8_t r = (uint8_t)(((uint32_t)f * 12) >> 10);
           if (r >= 12) r = 11;
           if (r != rootPC) {
-            rootPC = r;
-            setScale(scaleIdx);                  // пересчёт лестницы
+            changeRoot(r);
             if (!swapLayers) latchNoteAssignmentPots();
             markSettingsDirty();
             *putStr(putStr(b, "ROOT "), NOTE_NAMES[rootPC]) = 0;
             setOverlay(b);
+          }
+        } else if (i == 1) {                    // POT2 = scale-profile
+          const uint8_t value = potZone(f, CHORD_PROFILE_COUNT);
+          if (value != chordProfile) {
+            chordProfile = value;
+            *putU(putStr(b, "PROFILE "), (uint16_t)(chordProfile + 1)) = 0;
+            setOverlay(b);
+          }
+        } else if (i == 2) {                    // POT3 = inversion
+          const uint8_t value = potZone(f, CHORD_VOICES);
+          if (value != chordInversion) {
+            chordInversion = value;
+            *putU(putStr(b, "INVERSION "), chordInversion) = 0;
+            setOverlay(b);
+          }
+        } else if (i == 3) {                    // POT4 = voices 3..6
+          const uint8_t value = (uint8_t)(3 + potZone(f, 4));
+          if (value != chordVoiceCount) {
+            chordVoiceCount = value;
+            *putU(putStr(b, "VOICES "), chordVoiceCount) = 0;
+            setOverlay(b);
+          }
+        } else if (i == 4) {                    // POT5 = spread
+          const uint8_t value = potZone(f, 4);
+          if (value != chordSpread) {
+            chordSpread = value;
+            *putU(putStr(b, "SPREAD "), (uint16_t)(chordSpread + 1)) = 0;
+            setOverlay(b);
+          }
+        } else if (i == 5) {                    // POT6 = progression bank
+          const uint8_t value = potZone(f, CHORD_BANK_COUNT);
+          if (value != chordBank) {
+            chordBank = value;
+            *putU(putStr(b, "BANK "), (uint16_t)(chordBank + 1)) = 0;
+            setOverlay(b);
+          }
+        } else if (i == 6) {                    // POT7 = chord register
+          const int8_t value = (int8_t)potZone(f, 5) - 2;
+          if (value != chordRegister) {
+            chordRegister = value;
+            previousVoiceCount = 0;
+            neoState = NEO_INVALID;
+            char *p = putStr(b, "REGISTER ");
+            if (chordRegister >= 0) *p++ = '+';
+            *putI(p, chordRegister) = 0;
+            setOverlay(b);
+          }
+        } else if (i == 7) {                    // POT8 = auto voice leading
+          const bool value = f >= 512;
+          if (value != chordVoiceLeading) {
+            chordVoiceLeading = value;
+            setOverlay(value ? "VOICE LEAD ON" : "VOICE LEAD OFF");
           }
         }
         break;
@@ -1279,6 +1899,44 @@ void drawPiano(uint16_t pcMask) {
     display.fillRect(PC_WHITE[rootPC] * 9 + 4, 19, 2, 2, SSD1306_WHITE);
   else
     display.fillRect(PC_GAP[rootPC] * 9 + 9, 10, 2, 2, SSD1306_WHITE);
+}
+
+bool oledWireWrite(uint8_t control, const uint8_t *data, uint8_t length) {
+  Wire.beginTransmission(OLED_ADDR);
+  Wire.write(control);
+  Wire.write(data, length);
+  uint8_t error = Wire.endTransmission();
+  const bool timedOut = Wire.getWireTimeoutFlag();
+  if (timedOut) Wire.clearWireTimeoutFlag();
+  if (!error && !timedOut) return true;
+  hasOled = false;
+  oledTxSlot = OLED_PAGE_COUNT;
+  return false;
+}
+
+bool oledSendPage(uint8_t page) {
+  Wire.setClock(OLED_I2C_HZ);
+  const uint8_t address[] = {
+    SSD1306_PAGEADDR, page, page,
+    SSD1306_COLUMNADDR, 0, OLED_WIDTH_PX - 1
+  };
+  if (!oledWireWrite(0x00, address, sizeof(address))) return false;
+
+  const uint8_t *src =
+      display.getBuffer() + (uint16_t)page * OLED_WIDTH_PX;
+  uint8_t left = OLED_WIDTH_PX;
+  while (left) {
+    const uint8_t n = left > OLED_DATA_PER_TX ? OLED_DATA_PER_TX : left;
+    if (!oledWireWrite(0x40, src, n)) return false;
+    src += n;
+    left -= n;
+  }
+  return true;
+}
+
+void oledSendNextPage() {
+  const uint8_t page = (oledTxSlot + 3) & 0x03;
+  if (oledSendPage(page)) oledTxSlot++;
 }
 
 void drawScreen() {
@@ -1325,40 +1983,41 @@ void drawScreen() {
 
   display.setCursor(0, 25);                    // нижняя строка
   display.print(overlayUntil ? overlay : lastEvent);
-
-  display.display();
-  if (Wire.getWireTimeoutFlag()) {
-    // Залипшая I2C-линия больше не останавливает MIDI навсегда. Wire timeout
-    // прерывает транзакцию, после чего отключаем дальнейшие refresh OLED.
-    Wire.clearWireTimeoutFlag();
-    hasOled = false;
-  }
 }
 
 void applyBrightness() {
   if (!hasOled) return;
-  display.ssd1306_command(SSD1306_SETCONTRAST);
-  display.ssd1306_command(oledBrightness);
+  Wire.setClock(OLED_I2C_HZ);
+  const uint8_t command[] = {SSD1306_SETCONTRAST, oledBrightness};
+  oledWireWrite(0x00, command, sizeof(command));
 }
 
 void displayTask() {
-  if (overlayUntil && (int32_t)(millis() - overlayUntil) >= 0) {
+  const uint32_t now = millis();
+  if (overlayUntil && (int32_t)(now - overlayUntil) >= 0) {
     overlayUntil = 0;
     previewNote = -1;
     dispDirty = true;
   }
-  if (!hasOled || !dispDirty) return;
-  if (millis() - dispLastDraw < 40) return;
-  dispLastDraw = millis();
+  if (!hasOled) return;
+
+  // Framebuffer не меняем в середине кадра: одна 128-byte page за loop.
+  if (oledTxSlot < OLED_PAGE_COUNT) {
+    oledSendNextPage();
+    return;
+  }
+  if (!dispDirty || now - dispLastDraw < 40) return;
+  dispLastDraw = now;
   dispDirty = false;
   drawScreen();
+  oledTxSlot = 0;
+  oledSendNextPage();             // status/overlay появляется первым
 }
 
 void ledTask() {
-  if (PIN_LED >= 0 && ledOffAt &&
-      (int32_t)(millis() - ledOffAt) >= 0) {
-    digitalWrite(PIN_LED, LOW);
+  if (ledOffAt && (int32_t)(millis() - ledOffAt) >= 0) {
     ledOffAt = 0;
+    rgbWrite(ledBaseColor);
   }
 }
 
@@ -1372,13 +2031,12 @@ void setup() {
   digitalWrite(MUX_S1, LOW);
   digitalWrite(MUX_S2, LOW);
   for (uint8_t z = 0; z < N_MUX; z++) pinMode(MUX_Z[z], INPUT);
-  for (uint8_t i = 0; i < N_KEYS; i++)
-    if (KEYS[i].src == 0xFE)
-      pinMode(KEYS[i].chan, KEYS[i].activeLow ? INPUT_PULLUP : INPUT);
-  if (PIN_LED >= 0) {
-    pinMode(PIN_LED, OUTPUT);
-    digitalWrite(PIN_LED, LOW);
-  }
+  pinMode(PIN_LED_R, OUTPUT);
+  pinMode(PIN_LED_G, OUTPUT);
+  pinMode(PIN_LED_B, OUTPUT);
+  digitalWrite(PIN_LED_R, LOW);
+  digitalWrite(PIN_LED_G, LOW);
+  digitalWrite(PIN_LED_B, LOW);
 
   // У запаянного nRF CE не должен плавать HIGH, а CSN — случайно выбирать
   // SPI-устройство даже в сборке без RX или до вызова radio.begin().
@@ -1393,12 +2051,6 @@ void setup() {
     for (uint8_t v = 0; v < CHORD_VOICES; v++) sounding[j].note[v] = NO_NOTE;
     sounding[j].channel = 0;
   }
-  for (uint8_t i = 0; i < N_POTS; i++) {
-    potToKey[i] = -1;
-  }
-  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
-    potToKey[KEY_POT[j]] = (int8_t)j;
-  }
 
   // Defaults применяются внутри loadSettings(); валидный блок TMD1 затем
   // заменяет их. Ни byte 0..9, ни официальные radio IDs здесь не пишутся.
@@ -1407,10 +2059,11 @@ void setup() {
 #if ENABLE_NRF_RX
   setupRadioReceiver();
 #endif
+  updateLedBase();
 
   Wire.begin();
   Wire.setWireTimeout(OLED_WIRE_TIMEOUT_US, true);
-  Wire.setClock(400000UL);
+  Wire.setClock(OLED_I2C_HZ);
   hasOled = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR, true, false);
   if (Wire.getWireTimeoutFlag()) {
     Wire.clearWireTimeoutFlag();
@@ -1422,11 +2075,12 @@ void setup() {
     // 800 ms больше нет, поэтому радио и кнопки готовы практически сразу.
     display.clearDisplay();
     applyBrightness();          // восстановить сохранённую яркость
+    oledTxSlot = OLED_PAGE_COUNT;
   }
 
   // первичное чтение — без пачки событий на старте
   for (uint8_t i = 0; i < N_POTS; i++) {
-    uint16_t raw = readNode(POTS[i].src, POTS[i].chan);
+    uint16_t raw = readPackedNode(POT_NODES, i);
     potFilt[i] = raw;
     potSent7[i] = (uint8_t)(raw >> 3);
     potSentRaw[i] = raw;
@@ -1457,10 +2111,7 @@ void loop() {
   updateMode();
   dispatchKeyChanges(changedKeys);
   updatePots();
-  if (usbDirty) {
-    MidiUSB.flush();
-    usbDirty = false;
-  }
+  UsbMidiTx::task();
   displayTask();
   ledTask();
   settingsTask();
