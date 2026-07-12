@@ -189,7 +189,7 @@ int8_t   chordRegister = 0;
 bool     chordVoiceLeading = true;
 uint8_t  previousVoicing[CHORD_VOICES];
 uint8_t  previousVoiceCount = 0;
-// bit7 = minor, bits0..6 = MIDI root 24..95.
+// bit7 = minor, low nibble = root pitch class 0..11.
 uint8_t  neoState = NEO_INVALID;
 
 uint16_t potFilt[N_POTS];
@@ -1324,21 +1324,31 @@ uint8_t finishVoicing(int16_t *base, uint8_t count,
   if (!fitWholeVoicing(base, count, period)) return 0;
   uint8_t preferred = chordInversion;
   while (preferred >= count) preferred -= count;
+  for (uint8_t r = 0; r < preferred; r++) {
+    rotateLowestVoice(base, count, period);
+  }
+  if (!fitWholeVoicing(base, count, period)) return 0;
+  int16_t nominalSum = 0;
+  for (uint8_t v = 0; v < count; v++) nominalSum += base[v];
+  const int16_t registerLimit = (int16_t)count * period / 2;
   bool found = false;
 
   if (chordVoiceLeading && previousVoiceCount == count) {
     uint16_t bestMovement = 0xFFFF;
     int16_t candidate[CHORD_VOICES];
     memcpy(candidate, base, count * sizeof(candidate[0]));
-    for (uint8_t r = 0; r < preferred; r++) {
-      rotateLowestVoice(candidate, count, period);
-    }
     for (uint8_t k = 0; k < count; k++) {
-      if (!fitWholeVoicing(candidate, count, period)) continue;
+      if (!fitWholeVoicing(candidate, count, period)) break;
+      int16_t candidateSum = 0;
+      for (uint8_t v = 0; v < count; v++) candidateSum += candidate[v];
       for (int8_t reg = -2; reg <= 2; reg++) {
         const int16_t delta = (int16_t)reg * period;
         if (candidate[0] + delta < 0 ||
             candidate[count - 1] + delta > 127) continue;
+        int16_t registerDistance =
+            candidateSum + (int16_t)count * delta - nominalSum;
+        if (registerDistance < 0) registerDistance = -registerDistance;
+        if (registerDistance > registerLimit) continue;
         uint16_t movement = 0;
         for (uint8_t v = 0; v < count; v++) {
           const int16_t pitch = candidate[v] + delta;
@@ -1359,10 +1369,6 @@ uint8_t finishVoicing(int16_t *base, uint8_t count,
   }
 
   if (!found) {
-    for (uint8_t r = 0; r < preferred; r++) {
-      rotateLowestVoice(base, count, period);
-    }
-    if (!fitWholeVoicing(base, count, period)) return 0;
     for (uint8_t v = 0; v < count; v++) out[v] = (uint8_t)base[v];
   }
   memcpy(previousVoicing, out, count);
@@ -1428,9 +1434,9 @@ uint8_t buildQualityChord(int16_t root, uint8_t quality, uint8_t *out) {
   return finishVoicing(work, target, 12, out);
 }
 
-uint8_t foldNeoRoot(int16_t root) {
-  while (root < 24) root += 12;
-  while (root > 95) root -= 12;
+uint8_t wrapPitchClass(int16_t root) {
+  if (root < 0) root += 12;
+  else if (root >= 12) root -= 12;
   return (uint8_t)root;
 }
 
@@ -1444,9 +1450,7 @@ bool homeScaleIsMinor() {
 }
 
 void resetNeoState() {
-  const int16_t root = 48 + rootPC + curScale.period * octOffset +
-                       12 * chordRegister;
-  neoState = foldNeoRoot(root);
+  neoState = rootPC;
   if (homeScaleIsMinor()) neoState |= 0x80;
 }
 
@@ -1455,18 +1459,18 @@ void seedNeoFromQuality(int16_t root, uint8_t quality) {
   if (quality == Q_MIN || quality == Q_MIN7) minor = true;
   else if (quality == Q_MAJ || quality == Q_MAJ7 || quality == Q_DOM7) minor = false;
   else return;
-  neoState = foldNeoRoot(root);
+  neoState = wrapPitchClass(root);
   if (minor) neoState |= 0x80;
 }
 
 void applyNeoOperation(uint8_t operation) {
   if (neoState == NEO_INVALID) resetNeoState();
-  int16_t root = neoState & 0x7F;
+  int16_t root = neoState & 0x0F;
   bool minor = neoState & 0x80;
   if (operation == 0) minor = !minor;           // Parallel
   else if (operation == 1) { root += minor ? 3 : -3; minor = !minor; }
   else if (operation == 2) { root += minor ? -4 : 4; minor = !minor; }
-  neoState = foldNeoRoot(root);
+  neoState = wrapPitchClass(root);
   if (minor) neoState |= 0x80;
 }
 
@@ -1474,23 +1478,28 @@ uint8_t buildProgressionChord(uint8_t key, uint8_t *out) {
   const uint8_t bank = chordBank < CHORD_BANK_COUNT ? chordBank : 0;
   const uint8_t descriptor = pgm_read_byte(&PROGRESSION_BANKS[bank][key]);
   const uint8_t quality = descriptor >> 4;
-  const int16_t root = 48 + rootPC + (descriptor & 0x0F) +
+  const uint8_t rootOffset = descriptor & 0x0F;
+  const int16_t root = 48 + rootPC + rootOffset +
                        curScale.period * octOffset + 12 * chordRegister;
   const uint8_t count = buildQualityChord(root, quality, out);
-  if (count) seedNeoFromQuality(root, quality);
+  if (count) seedNeoFromQuality(rootPC + rootOffset, quality);
   return count;
 }
 
 uint8_t buildPlrChord(uint8_t key, uint8_t *out) {
-  if (key == 7) resetNeoState();
-  else {
+  if (key == 7) {
+    resetNeoState();
+    previousVoiceCount = 0;  // HOME всегда даёт один канонический voicing
+  } else {
     if (neoState == NEO_INVALID) resetNeoState();
     const uint8_t sequence = pgm_read_byte(PLR_SEQUENCES + key);
     applyNeoOperation(sequence & 0x0F);
     const uint8_t second = sequence >> 4;
     if (second < 3) applyNeoOperation(second);
   }
-  return buildQualityChord(neoState & 0x7F,
+  const int16_t root = 48 + (neoState & 0x0F) +
+                       curScale.period * octOffset + 12 * chordRegister;
+  return buildQualityChord(root,
                            neoState & 0x80 ? Q_MIN : Q_MAJ, out);
 }
 
