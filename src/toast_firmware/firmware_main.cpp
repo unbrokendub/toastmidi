@@ -10,11 +10,11 @@
  *   KEY4 (SHIFT) + POT9    — выбор скейла
  *   POT1..8                — нота закреплённой кнопки (внутри скейла)
  *   KEY4 + POT1..8         — MIDI CC (слои можно поменять местами)
- *   KEY4 + KEY11 + POT9    — MIDI-канал
- *   KEY4 + KEY11 + POT1..8 — CC-номер пота
- *   KEY4 + KEY1  + POT9    — палитра P/R/L BASIC / EXT
- *   KEY4 + KEY1  + POT1    — тоника (root) скейла
- *   KEY4 + KEY1 + POT2..8  — параметры harmony engine
+ *   KEY4 + KEY1  + POT9    — MIDI-канал
+ *   KEY4 + KEY1  + POT1..8 — CC-номер пота
+ *   KEY4 + KEY11 + POT9    — палитра P/R/L BASIC / EXT
+ *   KEY4 + KEY11 + POT1    — тоника (root) скейла
+ *   KEY4 + KEY11 + POT2..8 — параметры harmony engine
  *
  * Все события идут в USB-MIDI и в DIN/TRS MIDI OUT одновременно.
  * OLED: клавиатура одной октавы + статус + подсказки действий.
@@ -1688,8 +1688,8 @@ void updateMode() {
   Mode m = M_PLAY;
   if (keyState[BTN_SHIFT]) {
     m = M_SHIFT;
-    if (keyState[BTN_OCT_DOWN]) { m = M_SETUP; octConsumed[0] = true; }
-    else if (keyState[BTN_OCT_UP]) { m = M_ROOT; octConsumed[1] = true; }
+    if (keyState[BTN_OCT_DOWN]) { m = M_ROOT; octConsumed[0] = true; }
+    else if (keyState[BTN_OCT_UP]) { m = M_SETUP; octConsumed[1] = true; }
   }
   if (m != mode) {
     mode = m;

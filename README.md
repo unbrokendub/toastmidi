@@ -50,14 +50,14 @@ KEY8–POT7, KEY7–POT3, KEY3–POT8, KEY2–POT4. POT9 — VALUE.
 одновременно или использованы с PAD, обе помечаются как модификаторы и уже
 не могут случайно изменить регистр.
 
-### SETUP: SHIFT + OCT−
+### SETUP: SHIFT + OCT+
 
 | Пот | Параметр |
 |---|---|
 | POT1…8 | CC-номер соответствующего потенциометра |
 | POT9 | MIDI channel 1…16 |
 
-### ROOT/HARMONY: SHIFT + OCT+
+### ROOT/HARMONY: SHIFT + OCT−
 
 | Пот | Параметр |
 |---|---|
