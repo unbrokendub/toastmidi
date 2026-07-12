@@ -1,5 +1,5 @@
 /*
- * TOAST — кастомная прошивка v0.1 «скейл-клавиатура»
+ * TOAST — кастомная прошивка v0.2 «скейл-клавиатура»
  * SpaceMelodyLab TOAST v1.1 (Arduino Pro Micro / ATmega32U4)
  *
  * Управление:
@@ -14,19 +14,20 @@
  *
  * Все события идут в USB-MIDI и в DIN/TRS MIDI OUT одновременно.
  * OLED: клавиатура одной октавы + статус + подсказки действий.
+ * Штатная радиопанель принимается через nRF24L01+ (это не BLE).
+ * Настройки сохраняются в EEPROM отложенно, без записи первых 10 байт.
  */
 
 #include <Arduino.h>
+#include <EEPROM.h>
 #include <Wire.h>
 #include <MIDIUSB.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "config.h"
 
-#if ENABLE_NRF
+#if ENABLE_NRF_RX
 #include <SPI.h>
-#include <RF24.h>
-RF24 radio(NRF_CE_PIN, NRF_CSN_PIN);
 bool nrfOk = false;
 #endif
 
@@ -37,35 +38,88 @@ bool hasOled = false;
 
 struct ScaleDef {
   uint8_t len;
-  uint8_t deg[12];
+  uint8_t period;                   // 12 = октава; 19 = тритава Болен-Пирса
+  uint8_t deg[13];
   char name[11];
 };
 
 const ScaleDef SCALES[] PROGMEM = {
-  {12, {0,1,2,3,4,5,6,7,8,9,10,11}, "CHROMATIC"},
-  {7,  {0,2,4,5,7,9,11},            "MAJOR"},
-  {7,  {0,2,3,5,7,8,10},            "MINOR"},
-  {7,  {0,2,3,5,7,8,11},            "HARM MINOR"},
-  {7,  {0,2,3,5,7,9,11},            "MEL MINOR"},
-  {7,  {0,2,3,5,7,9,10},            "DORIAN"},
-  {7,  {0,1,3,5,7,8,10},            "PHRYGIAN"},
-  {7,  {0,2,4,6,7,9,11},            "LYDIAN"},
-  {7,  {0,2,4,5,7,9,10},            "MIXOLYDIAN"},
-  {7,  {0,1,3,5,6,8,10},            "LOCRIAN"},
-  {5,  {0,2,4,7,9},                 "PENTA MAJ"},
-  {5,  {0,3,5,7,10},                "PENTA MIN"},
-  {6,  {0,3,5,6,7,10},              "BLUES MIN"},
-  {6,  {0,2,3,4,7,9},               "BLUES MAJ"},
-  {6,  {0,2,4,6,8,10},              "WHOLE TONE"},
-  {8,  {0,2,3,5,6,8,9,11},          "DIM W-H"},
-  {8,  {0,1,3,4,6,7,9,10},          "DIM H-W"},
-  {7,  {0,1,4,5,7,8,10},            "PHRYG DOM"},
-  {7,  {0,2,3,6,7,8,11},            "HUNGAR MIN"},
-  {7,  {0,1,4,5,7,8,11},            "DBL HARMON"},
-  {5,  {0,2,3,7,8},                 "HIRAJOSHI"},
-  {5,  {0,1,5,7,10},                "IN SEN"},
-  {5,  {0,1,5,6,10},                "IWATO"},
-  {5,  {0,2,5,7,9},                 "YO"},
+  {12, 12, {0,1,2,3,4,5,6,7,8,9,10,11}, "CHROMATIC"},
+  {7,  12, {0,2,4,5,7,9,11},            "MAJOR"},
+  {7,  12, {0,2,3,5,7,8,10},            "MINOR"},
+  {7,  12, {0,2,3,5,7,8,11},            "HARM MINOR"},
+  {7,  12, {0,2,3,5,7,9,11},            "MEL MINOR"},
+  {7,  12, {0,2,3,5,7,9,10},            "DORIAN"},
+  {7,  12, {0,1,3,5,7,8,10},            "PHRYGIAN"},
+  {7,  12, {0,2,4,6,7,9,11},            "LYDIAN"},
+  {7,  12, {0,2,4,5,7,9,10},            "MIXOLYDIAN"},
+  {7,  12, {0,1,3,5,6,8,10},            "LOCRIAN"},
+  {5,  12, {0,2,4,7,9},                 "PENTA MAJ"},
+  {5,  12, {0,3,5,7,10},                "PENTA MIN"},
+  {6,  12, {0,3,5,6,7,10},              "BLUES MIN"},
+  {6,  12, {0,2,3,4,7,9},               "BLUES MAJ"},
+  {6,  12, {0,2,4,6,8,10},              "WHOLE TONE"},
+  {8,  12, {0,2,3,5,6,8,9,11},          "DIM W-H"},
+  {8,  12, {0,1,3,4,6,7,9,10},          "DIM H-W"},
+  {7,  12, {0,1,4,5,7,8,10},            "PHRYG DOM"},
+  {7,  12, {0,2,3,6,7,8,11},            "HUNGAR MIN"},
+  {7,  12, {0,1,4,5,7,8,11},            "DBL HARMON"},
+  {5,  12, {0,2,3,7,8},                 "HIRAJOSHI"},
+  {5,  12, {0,1,5,7,10},                "IN SEN"},
+  {5,  12, {0,1,5,6,10},                "IWATO"},
+  {5,  12, {0,2,5,7,9},                 "YO"},
+  {7,  12, {0,2,4,5,7,8,11},            "HARM MAJOR"},
+  {7,  12, {0,2,4,6,7,9,10},            "LYDIAN DOM"},
+  {7,  12, {0,1,3,4,6,8,10},            "ALTERED"},
+  {7,  12, {0,2,3,5,6,8,10},            "LOCRIAN #2"},
+  {7,  12, {0,2,4,5,7,8,10},            "MIXOLYD b6"},
+  {7,  12, {0,1,3,5,7,9,10},            "DORIAN b2"},
+  {8,  12, {0,2,4,5,7,9,10,11},         "BEBOP DOM"},
+  {8,  12, {0,2,4,5,7,8,9,11},          "BEBOP MAJ"},
+  {7,  12, {0,1,3,5,7,8,11},            "NEAPOL MIN"},
+  {7,  12, {0,1,3,5,7,9,11},            "NEAPOL MAJ"},
+  {7,  12, {0,1,4,6,8,10,11},           "ENIGMATIC"},
+  {6,  12, {0,2,4,6,9,10},              "PROMETHEUS"},
+  {6,  12, {0,3,4,7,8,11},              "AUGMENTED"},
+  {6,  12, {0,1,4,6,7,10},              "TRITONE"},
+  {7,  12, {0,1,4,5,6,8,11},            "PERSIAN"},
+  {7,  12, {0,3,4,6,7,9,10},            "HUNGAR MAJ"},
+  {7,  12, {0,2,3,6,7,9,10},            "ROMANIAN"},
+  {5,  12, {0,2,5,7,10},                "EGYPTIAN"},
+  {5,  12, {0,2,3,7,9},                 "KUMOI"},
+  {5,  12, {0,1,3,7,8},                 "PELOG"},
+  {9,  12, {0,2,3,4,6,7,8,10,11},       "MESSIAEN 3"},
+  {8,  12, {0,1,2,5,6,7,8,11},          "MESSIAEN 4"},
+  {6,  12, {0,1,5,6,7,11},              "MESSIAEN 5"},
+  {8,  12, {0,2,4,5,6,8,10,11},         "MESSIAEN 6"},
+  {10, 12, {0,1,2,3,5,6,7,8,9,11},      "MESSIAEN 7"},
+  {9,  19, {0,3,4,7,9,12,13,16,18},     "BP LAMBDA"},
+  {13, 19, {0,1,3,4,6,7,9,10,12,13,15,16,18}, "BP CHROMA"},
+  {8,  12, {0,2,4,6,7,8,10,11},         "HARMONICS"},
+  {9,  12, {0,1,3,4,5,7,8,9,11},        "TCHEREPNIN"},
+  {6,  12, {0,3,5,6,7,11},              "BLUES MM7"},
+  {7,  12, {0,3,5,6,7,9,10},            "BLUES HEPT"},
+  {6,  12, {0,1,3,4,7,9},               "BLUES DHEX"},
+  {7,  12, {0,2,3,5,6,7,10},            "BLUES MOD"},
+  {8,  12, {0,2,3,5,6,7,9,10},          "BLUES OCT"},
+  {7,  12, {0,1,3,5,6,7,10},            "BLUES PHRY"},
+  {7,  12, {0,1,2,5,7,8,9},             "CHROM DOR"},
+  {7,  12, {0,3,4,5,8,10,11},           "CHROM PHRY"},
+  {7,  12, {0,1,3,4,6,8,9},             "ULTRA LOCR"},
+  {8,  12, {0,2,3,5,6,7,8,11},          "ALGERIAN"},
+  {7,  12, {0,1,4,5,6,9,10},            "ORIENTAL"},
+  {8,  12, {0,1,4,5,6,8,10,11},         "ENIGMA 8"},
+  {7,  12, {0,1,3,6,8,10,11},           "ENIGMA MIN"},
+  {7,  12, {0,1,4,5,7,9,10},            "BHAIRAV"},
+  {6,  12, {0,1,3,5,8,10},              "RITSU"},
+  {7,  12, {0,1,4,6,7,8,11},            "PURAVI bVI"},
+  {7,  12, {0,2,5,6,8,9,11},            "NOHKAN"},
+  {8,  12, {0,1,3,4,5,7,8,10},          "FLAMENCO"},
+  {8,  12, {0,2,3,5,6,8,10,11},         "SCHWARZ 42"},
+  {7,  12, {0,1,4,5,7,9,11},            "BHAIRUBAHR"},
+  {8,  12, {0,1,2,3,5,7,9,10},          "ADONAI MLK"},
+  {8,  12, {0,2,3,5,7,8,9,11},          "ZIRAFKEND"},
+  {8,  12, {0,2,3,5,7,8,10,11},         "UTIL MINOR"},
 };
 #define N_SCALES (sizeof(SCALES) / sizeof(SCALES[0]))
 
@@ -82,10 +136,11 @@ uint8_t  scaleIdx  = 0;
 uint8_t  rootPC    = 0;         // тоника 0..11 (C..B)
 int8_t   octOffset = 0;         // глобальный сдвиг октав (-3..+3)
 uint8_t  midiCh    = MIDI_CH;   // 0..15
-int16_t  ladderMax = 127;       // последний индекс «лестницы» скейла (нота <=127)
-int16_t  keyLadder[8];          // позиция каждой игровой кнопки в лестнице
-uint8_t  potCCnum[9];           // CC-номер каждого пота
-int8_t   potToKey[9];           // обратная карта: пот -> игровая кнопка (-1 = value)
+int16_t  ladderMin = 0;         // первый индекс лестницы, дающий MIDI note >= 0
+int16_t  ladderMax = 127;       // последний индекс лестницы, дающий note <= 127
+int16_t  keyLadder[N_NOTE_KEYS]; // позиция каждой игровой кнопки в лестнице
+uint8_t  potCCnum[N_POTS];       // CC-номер каждого пота
+int8_t   potToKey[N_POTS];       // обратная карта: пот -> игровая кнопка
 
 Mode     mode = M_PLAY;
 bool     swapLayers = false;    // true: поты без шифта крутят ноты, CC — под шифтом
@@ -93,21 +148,81 @@ bool     comboLatched = false;  // защёлка комбо SHIFT+обе окт
 int8_t   previewNote = -1;      // нота, выбираемая потом — подсветка на пиано
 uint8_t  velocity = KEY_VELOCITY;  // velocity нот, крутится value-потом в игре
 
-uint16_t potFilt[9];
-uint16_t potLatch[9];
-bool     potArmed[9];
-uint8_t  potSent7[9];
+uint16_t potFilt[N_POTS];
+uint16_t potLatch[N_POTS];
+bool     potArmed[N_POTS];
+uint8_t  potSent7[N_POTS];
+uint16_t potSentRaw[N_POTS];    // реальный deadband, а не только 7-bit квантование
 
 bool     keyState[N_KEYS];      // подтверждённые состояния всех 11 кнопок
 bool     keyRead[N_KEYS];
 uint32_t keyT[N_KEYS];
-uint8_t  sounding[8];           // звучащая нота игровой кнопки, 0xFF = тишина
+
+// У каждого источника запоминается не только высота, но и MIDI-канал,
+// на котором был отправлен Note On. Поэтому смена канала при удержанной
+// кнопке больше не оставляет зависшую ноту на старом канале.
+struct HeldNote {
+  uint8_t note;
+  uint8_t channel;
+};
+constexpr uint8_t NO_NOTE = 0xFF;
+HeldNote sounding[N_NOTE_KEYS];
+
+#if ENABLE_NRF_RX
+// Радиокнопка является самостоятельным источником: она может удерживаться
+// одновременно с кнопкой корпуса. Отдельное состояние также подавляет
+// повторы одинакового PRESS/RELEASE, которые пульт может посылать для
+// надёжности доставки.
+HeldNote radioNotes[NRF_BUTTON_COUNT];
+bool     radioDown[NRF_BUTTON_COUNT];
+uint8_t  radioCcChannel[NRF_BUTTON_COUNT];
+uint32_t radioPressedAt[NRF_BUTTON_COUNT];
+uint8_t  keypadId[NRF_PANEL_COUNT][6];
+bool     keypadIdValid[NRF_PANEL_COUNT];
+#endif
 
 bool     usbDirty  = false;
 bool     dispDirty = true;
 uint32_t ledOffAt = 0, dispLastDraw = 0, overlayUntil = 0;
 char     overlay[22] = "";
-char     lastEvent[22] = "TOAST v0.1";
+char     lastEvent[22] = "TOAST v0.2";
+
+// ================== отложенное EEPROM ==================
+
+// На little-endian AVR эти четыре байта лежат как ASCII "TMD1".
+constexpr uint32_t SETTINGS_MAGIC = 0x31444D54UL;
+constexpr uint8_t SETTINGS_VERSION = 1;
+constexpr uint8_t SETTINGS_FLAG_SWAP_LAYERS = 0x01;
+
+struct __attribute__((packed)) StoredSettings {
+  uint32_t magic;
+  uint8_t version;
+  uint8_t size;
+  uint8_t scale;
+  uint8_t root;
+  int8_t octave;
+  uint8_t channel;
+  uint8_t noteVelocity;
+  uint8_t flags;
+  uint8_t potCc[N_POTS];
+  int16_t keyStep[N_NOTE_KEYS];
+  uint16_t crc;
+};
+
+StoredSettings pendingSettings;
+bool settingsDirty = false;
+bool settingsWriteActive = false;
+uint8_t settingsWritePos = 0;
+uint32_t settingsChangedAt = 0;
+
+static_assert(N_KEYS <= 16, "key change mask is 16 bit");
+static_assert(N_NOTE_KEYS == 8, "UI and radio mapping expect eight note keys");
+static_assert(POT_VALUE < N_POTS, "POT_VALUE must index POTS");
+static_assert(sizeof(StoredSettings) <= 255, "EEPROM writer uses an 8-bit index");
+static_assert(SETTINGS_EEPROM_START >= 10, "first ten EEPROM bytes are reserved");
+static_assert(SETTINGS_EEPROM_START + sizeof(StoredSettings) <=
+                  NRF_EEPROM_KEYPAD_1,
+              "custom settings must not overlap official keypad IDs");
 
 // ================== утилиты ==================
 
@@ -115,9 +230,22 @@ void fmtNote(char *out, uint8_t n) {          // "C#3" (C3 = MIDI 60)
   snprintf(out, 5, "%s%d", NOTE_NAMES[n % 12], n / 12 - 2);
 }
 
-// k-я ступень лестницы скейла (все ноты скейла подряд от MIDI 0)
+// Деление вниз, а не к нулю. Обычный C/C++ operator / для отрицательных
+// чисел округляет к нулю, из-за чего ступени ниже root вычислялись бы
+// неверно. Отрицательные k нужны, чтобы скейл действительно покрывал
+// допустимые ноты у самого низа MIDI-диапазона.
+int16_t floorDiv(int16_t value, uint8_t divisor) {
+  int16_t quotient = value / divisor;
+  if (value % divisor < 0) quotient--;
+  return quotient;
+}
+
+// k-я ступень бесконечной лестницы скейла. Период повторения хранится в
+// описании скейла: 12 полутонов для обычной октавы и 19 для BP-тритавы.
 int16_t ladderNote(int16_t k) {
-  return rootPC + 12 * (k / curScale.len) + curScale.deg[k % curScale.len];
+  const int16_t cycle = floorDiv(k, curScale.len);
+  const uint8_t degree = (uint8_t)(k - cycle * curScale.len);
+  return rootPC + curScale.period * cycle + curScale.deg[degree];
 }
 
 uint8_t playedNote(uint8_t j) {               // с учётом сдвига октав
@@ -127,13 +255,21 @@ uint8_t playedNote(uint8_t j) {               // с учётом сдвига о
   return (uint8_t)n;
 }
 
-void resetLadder() {                          // кнопки = первые 8 ступеней от C3
-  for (uint8_t j = 0; j < 8; j++) keyLadder[j] = 5 * curScale.len + j;
+void resetLadder() {                          // кнопки = первые 8 ступеней от ~C3
+  int16_t base = curScale.len * (60 / curScale.period);
+  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) keyLadder[j] = base + j;
 }
 
 void setScale(uint8_t s) {
   scaleIdx = s;
   memcpy_P(&curScale, &SCALES[s], sizeof(ScaleDef));
+
+  // Ищем полный валидный диапазон индексов, включая отрицательные.
+  // Благодаря этому, например, скейл с root D может назначить C#/ниже D,
+  // если эта высота действительно входит в выбранный набор ступеней.
+  ladderMin = 0;
+  while (ladderNote(ladderMin) >= 0) ladderMin--;
+  ladderMin++;
   ladderMax = 0;
   while (ladderNote(ladderMax + 1) <= 127) ladderMax++;
   resetLadder();
@@ -147,6 +283,149 @@ void setOverlay(const char *s) {
   dispDirty = true;
 }
 
+bool anyNotesHeld() {
+  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
+    if (sounding[j].note != NO_NOTE) return true;
+  }
+#if ENABLE_NRF_RX
+  for (uint8_t i = 0; i < NRF_BUTTON_COUNT; i++) {
+    if (radioNotes[i].note != NO_NOTE) return true;
+  }
+#endif
+  return false;
+}
+
+// CRC делает оборванную запись безопасной: если питание исчезло в середине
+// отложенного сохранения, на следующем старте блок не будет принят частично.
+uint16_t settingsCrc(const StoredSettings &value) {
+  const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&value);
+  const size_t length = sizeof(StoredSettings) - sizeof(value.crc);
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < length; i++) {
+    crc ^= bytes[i];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+    }
+  }
+  return crc;
+}
+
+void setDefaultSettings() {
+  rootPC = 0;
+  octOffset = 0;
+  midiCh = MIDI_CH;
+  velocity = KEY_VELOCITY;
+  swapLayers = false;
+  setScale(0);
+  for (uint8_t i = 0; i < N_POTS; i++) potCCnum[i] = POTS[i].cc;
+}
+
+bool storedHeaderValid(const StoredSettings &saved) {
+  if (saved.magic != SETTINGS_MAGIC ||
+      saved.version != SETTINGS_VERSION ||
+      saved.size != sizeof(StoredSettings) ||
+      saved.crc != settingsCrc(saved)) {
+    return false;
+  }
+  if (saved.scale >= N_SCALES || saved.root >= 12 ||
+      saved.octave < -3 || saved.octave > 3 || saved.channel >= 16 ||
+      saved.noteVelocity < 1 || saved.noteVelocity > 127 ||
+      (saved.flags & ~SETTINGS_FLAG_SWAP_LAYERS)) {
+    return false;
+  }
+  for (uint8_t i = 0; i < N_POTS; i++) {
+    if (saved.potCc[i] > 127) return false;
+  }
+  return true;
+}
+
+void loadSettings() {
+  // Сначала формируем полностью рабочие defaults. Любая проблема с magic,
+  // версией, CRC или диапазонами оставляет контроллер именно в них.
+  setDefaultSettings();
+
+  StoredSettings saved;
+  EEPROM.get(SETTINGS_EEPROM_START, saved);
+  if (!storedHeaderValid(saved)) return;
+
+  rootPC = saved.root;
+  setScale(saved.scale);  // одновременно пересчитывает ladderMin/ladderMax
+  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
+    if (saved.keyStep[j] < ladderMin || saved.keyStep[j] > ladderMax) {
+      setDefaultSettings();
+      return;
+    }
+  }
+
+  octOffset = saved.octave;
+  midiCh = saved.channel;
+  velocity = saved.noteVelocity;
+  swapLayers = saved.flags & SETTINGS_FLAG_SWAP_LAYERS;
+  for (uint8_t i = 0; i < N_POTS; i++) potCCnum[i] = saved.potCc[i];
+  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) keyLadder[j] = saved.keyStep[j];
+}
+
+void snapshotSettings() {
+  memset(&pendingSettings, 0, sizeof(pendingSettings));
+  pendingSettings.magic = SETTINGS_MAGIC;
+  pendingSettings.version = SETTINGS_VERSION;
+  pendingSettings.size = sizeof(StoredSettings);
+  pendingSettings.scale = scaleIdx;
+  pendingSettings.root = rootPC;
+  pendingSettings.octave = octOffset;
+  pendingSettings.channel = midiCh;
+  pendingSettings.noteVelocity = velocity;
+  pendingSettings.flags = swapLayers ? SETTINGS_FLAG_SWAP_LAYERS : 0;
+  for (uint8_t i = 0; i < N_POTS; i++) pendingSettings.potCc[i] = potCCnum[i];
+  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
+    pendingSettings.keyStep[j] = keyLadder[j];
+  }
+  pendingSettings.crc = settingsCrc(pendingSettings);
+}
+
+void markSettingsDirty() {
+  settingsDirty = true;
+  settingsChangedAt = millis();
+}
+
+bool pendingSettingsAlreadyStored() {
+  const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&pendingSettings);
+  for (uint8_t i = 0; i < sizeof(StoredSettings); i++) {
+    if (EEPROM.read(SETTINGS_EEPROM_START + i) != bytes[i]) return false;
+  }
+  return true;
+}
+
+void settingsTask() {
+  // EEPROM.update() блокирует AVR примерно на несколько миллисекунд, поэтому
+  // пишем максимум один байт за loop и полностью ставим процесс на паузу,
+  // пока удерживается хотя бы одна проводная или беспроводная нота.
+  if (anyNotesHeld()) return;
+
+  if (settingsWriteActive) {
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&pendingSettings);
+    EEPROM.update(SETTINGS_EEPROM_START + settingsWritePos,
+                  bytes[settingsWritePos]);
+    settingsWritePos++;
+    if (settingsWritePos >= sizeof(StoredSettings)) settingsWriteActive = false;
+    return;
+  }
+
+  if (!settingsDirty ||
+      millis() - settingsChangedAt < SETTINGS_SAVE_DELAY_MS) {
+    return;
+  }
+
+  // Снимок отделён от живых переменных. Если пользователь поменяет ещё одну
+  // настройку уже во время записи, markSettingsDirty() оставит dirty=true,
+  // и после новой тихой паузы будет записан следующий целостный снимок.
+  snapshotSettings();
+  settingsDirty = false;
+  if (pendingSettingsAlreadyStored()) return;
+  settingsWritePos = 0;
+  settingsWriteActive = true;
+}
+
 // ================== чтение входов ==================
 
 uint16_t readNode(uint8_t src, uint8_t chan) {
@@ -154,14 +433,33 @@ uint16_t readNode(uint8_t src, uint8_t chan) {
   if (src == 0xFF || src == 0xFE) {
     pin = chan;
   } else {
+#if USE_FAST_PORTF_MUX && defined(__AVR_ATmega32U4__)
+    static_assert(MUX_S0 == A1 && MUX_S1 == A2 && MUX_S2 == A3,
+                  "fast PORTF mapping requires S0=A1, S1=A2, S2=A3");
+
+    // На этой плате S0=A1=PF6, S1=A2=PF5, S2=A3=PF4. Поэтому простой
+    // (chan << 4) развернул бы S0 и S2 и изменил уже подтверждённую probe
+    // нумерацию каналов. Явно раскладываем каждый бит chan на его реальную
+    // ногу, сохраняем PF7 и PF0..PF3 и меняем PF6..PF4 одной операцией.
+    const uint8_t selectBits = (uint8_t)(((chan & 0x01) << 6) |
+                                         ((chan & 0x02) << 4) |
+                                         ((chan & 0x04) << 2));
+    PORTF = (PORTF & 0x8F) | selectBits;
+#else
+    // Переносимый fallback для другой Arduino/другой разводки.
     digitalWrite(MUX_S0, chan & 1);
     digitalWrite(MUX_S1, (chan >> 1) & 1);
     digitalWrite(MUX_S2, (chan >> 2) & 1);
+#endif
+
+    // После переключения 74HC4051 даём аналоговому узлу установиться.
+    // Первый analogRead ниже намеренно выбрасывается: он заряжает sample &
+    // hold ADC от нового источника, второй уже используется как измерение.
     delayMicroseconds(50);
     pin = MUX_Z[src];
   }
   analogRead(pin);
-  return analogRead(pin);
+  return (uint16_t)analogRead(pin);
 }
 
 // ================== отправка MIDI ==================
@@ -179,35 +477,33 @@ void dinWrite3(uint8_t a, uint8_t b, uint8_t c) {
   Serial1.write(c);
 }
 
-#if ENABLE_NRF
-void nrfSend3(uint8_t a, uint8_t b, uint8_t c) {
-  if (!nrfOk) return;
-  uint8_t buf[3] = {a, b, c};
-  radio.write(buf, 3, true);
-}
-#else
-#define nrfSend3(a, b, c)
-#endif
+void sendCCOnChannel(uint8_t channel, uint8_t cc, uint8_t val) {
+  const uint8_t status = (uint8_t)(0xB0 | channel);
 
-void sendCC(uint8_t cc, uint8_t val) {
-  midiEventPacket_t p = {0x0B, (uint8_t)(0xB0 | midiCh), cc, val};
+  // DIN идёт первым намеренно. USB host иногда долго не забирает endpoint;
+  // MidiUSB.sendMIDI() в таком случае может ждать, но физический MIDI OUT
+  // уже получит событие и не будет зависеть от поведения компьютера.
+  dinWrite3(status, cc, val);
+  midiEventPacket_t p = {0x0B, status, cc, val};
   MidiUSB.sendMIDI(p);
   usbDirty = true;
-  dinWrite3(0xB0 | midiCh, cc, val);
-  nrfSend3(0xB0 | midiCh, cc, val);
   ledFlash();
   snprintf(lastEvent, sizeof(lastEvent), "CC%u = %u", cc, val);
   dispDirty = true;
 }
 
-void sendNote(uint8_t note, bool on) {
-  uint8_t st = (on ? 0x90 : 0x80) | midiCh;
-  uint8_t vel = on ? velocity : 0;
-  midiEventPacket_t p = {(uint8_t)(on ? 0x09 : 0x08), st, note, vel};
+void sendCC(uint8_t cc, uint8_t val) {
+  sendCCOnChannel(midiCh, cc, val);
+}
+
+void sendNoteEvent(uint8_t channel, uint8_t note, bool on) {
+  const uint8_t status = (uint8_t)((on ? 0x90 : 0x80) | channel);
+  const uint8_t vel = on ? velocity : 0;
+
+  dinWrite3(status, note, vel);
+  midiEventPacket_t p = {(uint8_t)(on ? 0x09 : 0x08), status, note, vel};
   MidiUSB.sendMIDI(p);
   usbDirty = true;
-  dinWrite3(st, note, vel);
-  nrfSend3(st, note, vel);
   ledFlash();
   if (on) {
     char nm[5];
@@ -217,22 +513,380 @@ void sendNote(uint8_t note, bool on) {
   dispDirty = true;
 }
 
+bool anotherSourceHolds(uint8_t note, uint8_t channel,
+                        const HeldNote *ignore) {
+  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
+    if (&sounding[j] != ignore && sounding[j].note == note &&
+        sounding[j].channel == channel) {
+      return true;
+    }
+  }
+#if ENABLE_NRF_RX
+  for (uint8_t i = 0; i < NRF_BUTTON_COUNT; i++) {
+    if (&radioNotes[i] != ignore && radioNotes[i].note == note &&
+        radioNotes[i].channel == channel) {
+      return true;
+    }
+  }
+#endif
+  return false;
+}
+
+void pressNoteSource(HeldNote &held, uint8_t note) {
+  if (held.note != NO_NOTE) return;
+  held.note = note;
+  held.channel = midiCh;
+
+  // Две разные физические кнопки могут быть назначены одной ноте. Второй
+  // Note On не нужен; Note Off уйдёт только после отпускания последнего
+  // источника с той же парой note/channel.
+  if (!anotherSourceHolds(note, held.channel, &held)) {
+    sendNoteEvent(held.channel, note, true);
+  }
+}
+
+void releaseNoteSource(HeldNote &held) {
+  if (held.note == NO_NOTE) return;
+  const uint8_t note = held.note;
+  const uint8_t channel = held.channel;
+  held.note = NO_NOTE;
+
+  if (!anotherSourceHolds(note, channel, nullptr)) {
+    sendNoteEvent(channel, note, false);
+  }
+}
+
+// ================== штатная радиопанель ==================
+
+#if ENABLE_NRF_RX
+namespace NrfRx {
+constexpr uint8_t R_REGISTER = 0x00;
+constexpr uint8_t W_REGISTER = 0x20;
+constexpr uint8_t REGISTER_MASK = 0x1F;
+constexpr uint8_t R_RX_PAYLOAD = 0x61;
+constexpr uint8_t FLUSH_TX = 0xE1;
+constexpr uint8_t FLUSH_RX = 0xE2;
+constexpr uint8_t NOP = 0xFF;
+
+constexpr uint8_t CONFIG = 0x00;
+constexpr uint8_t EN_AA = 0x01;
+constexpr uint8_t EN_RXADDR = 0x02;
+constexpr uint8_t SETUP_AW = 0x03;
+constexpr uint8_t SETUP_RETR = 0x04;
+constexpr uint8_t RF_CH = 0x05;
+constexpr uint8_t RF_SETUP = 0x06;
+constexpr uint8_t STATUS = 0x07;
+constexpr uint8_t RX_ADDR_P1 = 0x0B;
+constexpr uint8_t RX_PW_P0 = 0x11;
+constexpr uint8_t FIFO_STATUS = 0x17;
+constexpr uint8_t DYNPD = 0x1C;
+constexpr uint8_t FEATURE = 0x1D;
+
+SPISettings spiSettings(4000000, MSBFIRST, SPI_MODE0);
+
+void select(bool active) {
+  digitalWrite(NRF_CSN_PIN, active ? LOW : HIGH);
+}
+
+uint8_t command(uint8_t cmd) {
+  SPI.beginTransaction(spiSettings);
+  select(true);
+  const uint8_t status = SPI.transfer(cmd);
+  select(false);
+  SPI.endTransaction();
+  return status;
+}
+
+uint8_t readRegister(uint8_t reg) {
+  SPI.beginTransaction(spiSettings);
+  select(true);
+  SPI.transfer(R_REGISTER | (reg & REGISTER_MASK));
+  const uint8_t value = SPI.transfer(NOP);
+  select(false);
+  SPI.endTransaction();
+  return value;
+}
+
+void writeRegister(uint8_t reg, uint8_t value) {
+  SPI.beginTransaction(spiSettings);
+  select(true);
+  SPI.transfer(W_REGISTER | (reg & REGISTER_MASK));
+  SPI.transfer(value);
+  select(false);
+  SPI.endTransaction();
+}
+
+void writeBuffer(uint8_t reg, const uint8_t *src, uint8_t length) {
+  SPI.beginTransaction(spiSettings);
+  select(true);
+  SPI.transfer(W_REGISTER | (reg & REGISTER_MASK));
+  while (length--) SPI.transfer(*src++);
+  select(false);
+  SPI.endTransaction();
+}
+
+void readBuffer(uint8_t reg, uint8_t *dst, uint8_t length) {
+  SPI.beginTransaction(spiSettings);
+  select(true);
+  SPI.transfer(R_REGISTER | (reg & REGISTER_MASK));
+  while (length--) *dst++ = SPI.transfer(NOP);
+  select(false);
+  SPI.endTransaction();
+}
+
+uint8_t readPayload(uint8_t *dst) {
+  SPI.beginTransaction(spiSettings);
+  select(true);
+  const uint8_t status = SPI.transfer(R_RX_PAYLOAD);
+  for (uint8_t i = 0; i < NRF_PAYLOAD_SIZE; i++) dst[i] = SPI.transfer(NOP);
+  select(false);
+  SPI.endTransaction();
+  return status;
+}
+
+bool spiSelfTest() {
+  const uint8_t saved = readRegister(RF_CH);
+  writeRegister(RF_CH, 0x2A);
+  const uint8_t first = readRegister(RF_CH);
+  writeRegister(RF_CH, 0x55);
+  const uint8_t second = readRegister(RF_CH);
+  writeRegister(RF_CH, saved);
+  return first == 0x2A && second == 0x55;
+}
+
+bool configure() {
+  static_assert(NRF_ADDRESS_WIDTH == 5, "original radio uses 5-byte address");
+  digitalWrite(NRF_CE_PIN, LOW);
+
+  // Ниже намеренно повторены итоговые регистры оригинальной v1.7. Это
+  // устраняет неоднозначность enum разных версий RF24 и одновременно
+  // экономит flash по сравнению с включением всей TX/RX библиотеки.
+  writeRegister(CONFIG, 0x0C);                 // power-down, CRC16 selected
+  delay(5);
+  writeRegister(EN_AA, 0x3F);                  // auto-ack all pipes
+  writeRegister(EN_RXADDR, 0x02);              // only RX pipe 1
+  writeRegister(SETUP_AW, 0x03);               // five-byte address
+  writeRegister(SETUP_RETR, 0x5F);             // 1500 us, 15 retries
+  writeRegister(RF_CH, NRF_CHANNEL);            // 120 = 2520 MHz
+  writeRegister(RF_SETUP, 0x27);                // 250K, PA MAX, LNA bit
+  writeRegister(DYNPD, 0x00);
+  writeRegister(FEATURE, 0x00);
+  for (uint8_t pipe = 0; pipe < 6; pipe++) {
+    writeRegister((uint8_t)(RX_PW_P0 + pipe), NRF_PAYLOAD_SIZE);
+  }
+  writeBuffer(RX_ADDR_P1, NRF_RX_ADDRESS, NRF_ADDRESS_WIDTH);
+
+  command(FLUSH_RX);
+  command(FLUSH_TX);
+  writeRegister(STATUS, 0x70);                  // clear all pending IRQ flags
+
+  writeRegister(CONFIG, 0x0E);                 // PWR_UP, still PTX
+  delay(5);                                     // >1.5 ms startup requirement
+  writeRegister(CONFIG, 0x0F);                 // PRIM_RX
+  delayMicroseconds(150);
+  digitalWrite(NRF_CE_PIN, HIGH);
+  delayMicroseconds(150);
+
+  // Не ограничиваемся общим SPI self-test: читаем обратно именно те поля,
+  // ошибка которых дала бы внешне «живой», но навсегда молчащий receiver.
+  uint8_t address[NRF_ADDRESS_WIDTH];
+  readBuffer(RX_ADDR_P1, address, sizeof(address));
+  bool addressOk = true;
+  for (uint8_t i = 0; i < NRF_ADDRESS_WIDTH; i++) {
+    if (address[i] != NRF_RX_ADDRESS[i]) addressOk = false;
+  }
+  return addressOk &&
+         (readRegister(CONFIG) & 0x0F) == 0x0F &&
+         (readRegister(EN_AA) & 0x3F) == 0x3F &&
+         (readRegister(EN_RXADDR) & 0x3F) == 0x02 &&
+         (readRegister(SETUP_AW) & 0x03) == 0x03 &&
+         readRegister(SETUP_RETR) == 0x5F &&
+         (readRegister(RF_CH) & 0x7F) == NRF_CHANNEL &&
+         (readRegister(RF_SETUP) & 0x2E) == 0x26 &&
+         (readRegister(RX_PW_P0 + 1) & 0x3F) == NRF_PAYLOAD_SIZE &&
+         readRegister(DYNPD) == 0x00 && readRegister(FEATURE) == 0x00;
+}
+}  // namespace NrfRx
+
+bool bytesEqual(const uint8_t *a, const uint8_t *b, uint8_t length) {
+  while (length--) {
+    if (*a++ != *b++) return false;
+  }
+  return true;
+}
+
+bool idIsEmpty(const uint8_t *id) {
+  for (uint8_t i = 0; i < 6; i++) {
+    if (id[i] != 0xFF) return false;
+  }
+  return true;
+}
+
+void readOfficialKeypadIds() {
+  const uint16_t addresses[NRF_PANEL_COUNT] = {
+    NRF_EEPROM_KEYPAD_1, NRF_EEPROM_KEYPAD_2
+  };
+  for (uint8_t panel = 0; panel < NRF_PANEL_COUNT; panel++) {
+    for (uint8_t i = 0; i < 6; i++) {
+      keypadId[panel][i] = EEPROM.read((int)(addresses[panel] + i));
+    }
+    keypadIdValid[panel] = !idIsEmpty(keypadId[panel]);
+  }
+}
+
+int8_t panelForPayload(const uint8_t *payload) {
+  for (uint8_t panel = 0; panel < NRF_PANEL_COUNT; panel++) {
+    if (keypadIdValid[panel] && bytesEqual(payload, keypadId[panel], 6)) {
+      return (int8_t)panel;
+    }
+  }
+#if NRF_ACCEPT_FALLBACK_ID
+  // Живая панель этого экземпляра уже подтвердила ID "IlJRf4". Fallback
+  // применяется ТОЛЬКО если официальный slot 1 пуст. После штатного re-pair
+  // новый EEPROM ID становится единственным принятым, а старый пульт не
+  // сможет делить radioDown/state с новой панелью.
+  if (!keypadIdValid[0] &&
+      bytesEqual(payload, NRF_FALLBACK_KEYPAD_ID, 6)) {
+    return 0;
+  }
+#endif
+  return -1;
+}
+
+void handleRadioButton(uint8_t logicalButton, bool down) {
+  if (logicalButton >= NRF_BUTTON_COUNT ||
+      radioDown[logicalButton] == down) {
+    return;
+  }
+  radioDown[logicalButton] = down;
+  radioPressedAt[logicalButton] = down ? millis() : 0;
+
+  RadioButtonDef action;
+  memcpy_P(&action, &NRF_BUTTONS[logicalButton], sizeof(action));
+  switch (action.action) {
+    case RADIO_ACTION_SCALE_NOTE:
+      if (action.number >= N_NOTE_KEYS) return;
+      if (down) {
+        pressNoteSource(radioNotes[logicalButton], playedNote(action.number));
+      } else {
+        releaseNoteSource(radioNotes[logicalButton]);
+      }
+      break;
+
+    case RADIO_ACTION_CC_MOMENTARY:
+      if (action.number > 127) return;
+      if (down) {
+        // Канал press запоминается, чтобы release гарантированно ушёл туда
+        // же даже после смены глобального MIDI channel на панели TOAST.
+        radioCcChannel[logicalButton] = midiCh;
+        sendCCOnChannel(radioCcChannel[logicalButton], action.number,
+                        action.pressValue & 0x7F);
+      } else {
+        sendCCOnChannel(radioCcChannel[logicalButton], action.number,
+                        action.releaseValue & 0x7F);
+      }
+      break;
+
+    case RADIO_ACTION_DISABLED:
+    default:
+      break;
+  }
+}
+
+void processRadioPayload(const uint8_t *payload) {
+  const int8_t panel = panelForPayload(payload);
+  if (panel < 0) return;                       // чужая/непривязанная панель
+
+  const uint8_t event = payload[6];
+  if (event & 0x80) {
+    // bit7 — pairing announcement оригинальной системы. Самодельная
+    // прошивка намеренно не переписывает официальные ID 0x0208..0x0213:
+    // привязку делают штатной прошивкой, после чего мы её только читаем.
+    return;
+  }
+
+  const uint8_t code = event & 0x3F;
+  if (code >= NRF_BUTTONS_PER_PANEL) return;   // пока доказаны codes 0 и 1
+  const uint8_t logicalButton =
+      (uint8_t)(panel * NRF_BUTTONS_PER_PANEL + code);
+  handleRadioButton(logicalButton, event & 0x40);
+}
+
+void setupRadioReceiver() {
+  readOfficialKeypadIds();
+  for (uint8_t i = 0; i < NRF_BUTTON_COUNT; i++) {
+    radioNotes[i].note = NO_NOTE;
+    radioNotes[i].channel = 0;
+    radioDown[i] = false;
+    radioCcChannel[i] = midiCh;
+    radioPressedAt[i] = 0;
+  }
+
+  SPI.begin();
+  nrfOk = NrfRx::spiSelfTest() && NrfRx::configure();
+  if (!nrfOk) {
+    digitalWrite(NRF_CE_PIN, LOW);
+    snprintf(lastEvent, sizeof(lastEvent), "NRF NOT FOUND");
+    return;
+  }
+  snprintf(lastEvent, sizeof(lastEvent), "RADIO READY");
+}
+
+void radioTask() {
+  if (!nrfOk) return;
+
+  // RX FIFO физически вмещает три payload. Ограничение budget защищает loop
+  // от вечного чтения, если уже после старта модуль отвалится и MISO залипнет
+  // в нуле (тогда ложный FIFO_STATUS мог бы выглядеть как «не пусто»).
+  uint8_t budget = 3;
+  bool received = false;
+  while (budget-- && !(NrfRx::readRegister(NrfRx::FIFO_STATUS) & 0x01)) {
+    uint8_t payload[NRF_PAYLOAD_SIZE];
+    const uint8_t status = NrfRx::readPayload(payload);
+    const uint8_t pipe = (status >> 1) & 0x07;
+    if (pipe == 1) processRadioPayload(payload);
+    received = true;
+  }
+  if (received || (NrfRx::readRegister(NrfRx::STATUS) & 0x40)) {
+    NrfRx::writeRegister(NrfRx::STATUS, 0x40); // clear RX_DR after FIFO drain
+  }
+
+#if NRF_STUCK_HOLD_TIMEOUT_MS > 0
+  // nRF auto-ack надёжен для доставленного packet, но выключенная батарея
+  // между PRESS и RELEASE физически не может передать отпускание. Ограничиваем
+  // такой hold, чтобы MIDI note/CC и EEPROM writer не зависли навсегда.
+  const uint32_t now = millis();
+  for (uint8_t i = 0; i < NRF_BUTTON_COUNT; i++) {
+    if (radioDown[i] &&
+        now - radioPressedAt[i] >= NRF_STUCK_HOLD_TIMEOUT_MS) {
+      handleRadioButton(i, false);
+    }
+  }
+#endif
+}
+#endif
+
 // ================== кнопки ==================
 
 int8_t noteKeyIndexOf(uint8_t keyIdx) {
-  for (uint8_t j = 0; j < 8; j++)
-    if (NOTE_KEYS[j] == keyIdx) return j;
+  for (uint8_t j = 0; j < N_NOTE_KEYS; j++)
+    if (NOTE_KEYS[j] == keyIdx) return (int8_t)j;
   return -1;
 }
+
+void latchNoteAssignmentPots();
 
 void onKeyChange(uint8_t idx, bool down) {
   if (idx == BTN_SHIFT) { dispDirty = true; return; }
 
   if (idx == BTN_OCT_DOWN || idx == BTN_OCT_UP) {
     if (down && !keyState[BTN_SHIFT]) {          // без шифта — октава
-      int8_t d = (idx == BTN_OCT_UP) ? 1 : -1;
-      int8_t no = octOffset + d;
-      if (no >= -3 && no <= 3) octOffset = no;
+      const int8_t delta = (idx == BTN_OCT_UP) ? 1 : -1;
+      const int8_t nextOctave = (int8_t)(octOffset + delta);
+      if (nextOctave >= -3 && nextOctave <= 3) {
+        octOffset = nextOctave;
+        markSettingsDirty();
+      }
       char b[16];
       snprintf(b, sizeof(b), "OCTAVE %+d", octOffset);
       setOverlay(b);
@@ -244,22 +898,23 @@ void onKeyChange(uint8_t idx, bool down) {
   if (j < 0) return;
 
   if (down) {
-    if (mode == M_PLAY && sounding[j] == 0xFF) {
-      sounding[j] = playedNote(j);
-      sendNote(sounding[j], true);
+    if (mode == M_PLAY) {
+      pressNoteSource(sounding[j], playedNote((uint8_t)j));
     } else if (mode == M_SHIFT && j == 0) {      // SHIFT + первая кнопка
       resetLadder();
+      // Уже активированные note-поты не должны на следующем loop молча
+      // вернуть старые назначения. После reset их надо снова сдвинуть.
+      if (!swapLayers) latchNoteAssignmentPots();
+      markSettingsDirty();
       setOverlay("NOTES RESET");
     }
   } else {
-    if (sounding[j] != 0xFF) {                   // note-off отдаём всегда
-      sendNote(sounding[j], false);
-      sounding[j] = 0xFF;
-    }
+    releaseNoteSource(sounding[j]);              // note-off отдаём всегда
   }
 }
 
-void updateKeys() {
+uint16_t scanKeys() {
+  uint16_t changed = 0;
   for (uint8_t i = 0; i < N_KEYS; i++) {
     bool pressed;
     if (KEYS[i].src == 0xFE) {
@@ -275,7 +930,22 @@ void updateKeys() {
     }
     if (keyRead[i] != keyState[i] && millis() - keyT[i] >= KEY_DEBOUNCE_MS) {
       keyState[i] = keyRead[i];
-      onKeyChange(i, keyState[i]);
+      changed |= (uint16_t)1 << i;
+    }
+  }
+  return changed;
+}
+
+void dispatchKeyChanges(uint16_t changed) {
+  // Сначала все нажатия, затем отпускания. Если в одном скане одна кнопка
+  // передала ноту другой кнопке с тем же pitch, это не создаст короткую
+  // лишнюю пару Note Off/Note On посередине.
+  for (uint8_t pass = 0; pass < 2; pass++) {
+    const bool wantedState = pass == 0;
+    for (uint8_t i = 0; i < N_KEYS; i++) {
+      if ((changed & ((uint16_t)1 << i)) && keyState[i] == wantedState) {
+        onKeyChange(i, keyState[i]);
+      }
     }
   }
 }
@@ -289,6 +959,16 @@ void latchPots() {
   }
 }
 
+void latchNoteAssignmentPots() {
+  // Перевооружаем только восемь потов назначения нот. VALUE и возможные
+  // будущие непарные контроллеры не должны побочно менять своё поведение.
+  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
+    const uint8_t i = KEY_POT[j];
+    potLatch[i] = potFilt[i];
+    potArmed[i] = false;
+  }
+}
+
 void updateMode() {
   // SHIFT + обе октавные кнопки = поменять слои потов (CC <-> ноты)
   bool combo = keyState[BTN_SHIFT] && keyState[BTN_OCT_DOWN] &&
@@ -297,6 +977,7 @@ void updateMode() {
     comboLatched = true;
     swapLayers = !swapLayers;
     latchPots();
+    markSettingsDirty();
     setOverlay(swapLayers ? "POTS = NOTES" : "POTS = CC");
   } else if (!combo) {
     comboLatched = false;
@@ -316,24 +997,32 @@ void updateMode() {
 }
 
 void potSendCC(uint8_t i, uint16_t f) {
-  uint8_t v7 = f >> 3;
-  if (v7 != potSent7[i]) {
-    potSent7[i] = v7;
-    sendCC(potCCnum[i], v7);
-  }
+  int16_t delta = (int16_t)f - (int16_t)potSentRaw[i];
+  if (delta < 0) delta = -delta;
+  if (delta < POT_SEND_THRESHOLD) return;
+
+  const uint8_t v7 = (uint8_t)(f >> 3);
+  if (v7 == potSent7[i]) return;
+  potSentRaw[i] = f;
+  potSent7[i] = v7;
+  sendCC(potCCnum[i], v7);
 }
 
 void assignKeyNote(uint8_t j, uint16_t filt) {
-  int16_t k = (int32_t)filt * (ladderMax + 1) >> 10;
+  const uint16_t ladderSize = (uint16_t)(ladderMax - ladderMin + 1);
+  const uint16_t ladderOffset =
+      (uint16_t)(((uint32_t)filt * ladderSize) >> 10);
+  int16_t k = (int16_t)(ladderMin + (int16_t)ladderOffset);
   if (k > ladderMax) k = ladderMax;
   if (k == keyLadder[j]) return;
   keyLadder[j] = k;
+  markSettingsDirty();
   char b[20], nm[5];
   uint8_t pn = playedNote(j);
   fmtNote(nm, pn);
   snprintf(b, sizeof(b), "BTN%u = %s", j + 1, nm);
   setOverlay(b);
-  previewNote = pn;             // показать выбираемую ноту и на клавиатуре
+  previewNote = (int8_t)pn;     // показать выбираемую ноту и на клавиатуре
 }
 
 void updatePots() {
@@ -353,17 +1042,18 @@ void updatePots() {
     switch (mode) {
       case M_PLAY:
         if (i == POT_VALUE) {                    // value-пот в игре = velocity
-          uint8_t v = f >> 3;
+          uint8_t v = (uint8_t)(f >> 3);
           if (v < 1) v = 1;                      // 0 = note-off, нельзя
           if (v != velocity) {
             velocity = v;
+            markSettingsDirty();
             snprintf(b, sizeof(b), "VELOCITY %u", velocity);
             setOverlay(b);
           }
           break;
         }
         if (swapLayers) {
-          if (potToKey[i] >= 0) assignKeyNote(potToKey[i], f);
+          if (potToKey[i] >= 0) assignKeyNote((uint8_t)potToKey[i], f);
         } else {
           potSendCC(i, f);
         }
@@ -371,31 +1061,43 @@ void updatePots() {
 
       case M_SHIFT:
         if (i == POT_VALUE) {
-          uint8_t s = (uint32_t)f * N_SCALES >> 10;
+          uint8_t s = (uint8_t)(((uint32_t)f * N_SCALES) >> 10);
+          if (s >= N_SCALES) s = N_SCALES - 1;
           if (s != scaleIdx) {
-            setScale(s);
-            snprintf(b, sizeof(b), "%s", curScale.name);
-            setOverlay(b);
+            // Зоны 76 скейлов узкие — принимаем только глубже 3 отсчётов
+            // от границы, чтобы шум АЦП не листал скейлы сам
+            uint16_t lo = (uint16_t)(((uint32_t)s << 10) / N_SCALES);
+            uint16_t hi =
+                (uint16_t)(((uint32_t)(s + 1) << 10) / N_SCALES);
+            if (f >= lo + 3 && f + 3 < hi) {
+              setScale(s);
+              if (!swapLayers) latchNoteAssignmentPots();
+              markSettingsDirty();
+              snprintf(b, sizeof(b), "%s", curScale.name);
+              setOverlay(b);
+            }
           }
         } else if (swapLayers) {
           potSendCC(i, f);
         } else if (potToKey[i] >= 0) {
-          assignKeyNote(potToKey[i], f);
+          assignKeyNote((uint8_t)potToKey[i], f);
         }
         break;
 
       case M_SETUP:
         if (i == POT_VALUE) {
-          uint8_t c = f >> 6;
+          uint8_t c = (uint8_t)(f >> 6);
           if (c != midiCh) {
             midiCh = c;
+            markSettingsDirty();
             snprintf(b, sizeof(b), "CHANNEL %u", midiCh + 1);
             setOverlay(b);
           }
         } else {
-          uint8_t cc = f >> 3;
+          uint8_t cc = (uint8_t)(f >> 3);
           if (cc != potCCnum[i]) {
             potCCnum[i] = cc;
+            markSettingsDirty();
             snprintf(b, sizeof(b), "POT%u > CC%u", i + 1, cc);
             setOverlay(b);
           }
@@ -404,10 +1106,12 @@ void updatePots() {
 
       case M_ROOT:
         if (i == POT_VALUE) {
-          uint8_t r = (uint32_t)f * 12 >> 10;
+          uint8_t r = (uint8_t)(((uint32_t)f * 12) >> 10);
           if (r != rootPC) {
             rootPC = r;
             setScale(scaleIdx);                  // пересчёт лестницы
+            if (!swapLayers) latchNoteAssignmentPots();
+            markSettingsDirty();
             snprintf(b, sizeof(b), "ROOT %s", NOTE_NAMES[rootPC]);
             setOverlay(b);
           }
@@ -433,7 +1137,7 @@ void drawPiano(uint16_t pcMask) {
   }
   for (uint8_t pc = 0; pc < 12; pc++) {        // чёрные поверх
     if (PC_GAP[pc] < 0) continue;
-    uint8_t x = PC_GAP[pc] * 9 + 6;
+    uint8_t x = (uint8_t)(PC_GAP[pc] * 9 + 6);
     display.fillRect(x, 0, 7, 13, SSD1306_BLACK);
     display.drawRect(x, 0, 7, 13, SSD1306_WHITE);
     if (pcMask & (1u << pc))
@@ -450,8 +1154,18 @@ void drawScreen() {
   display.clearDisplay();
 
   uint16_t pcMask = 0;
-  for (uint8_t j = 0; j < 8; j++)
-    if (sounding[j] != 0xFF) pcMask |= 1u << (sounding[j] % 12);
+  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
+    if (sounding[j].note != NO_NOTE) {
+      pcMask |= 1u << (sounding[j].note % 12);
+    }
+  }
+#if ENABLE_NRF_RX
+  for (uint8_t i = 0; i < NRF_BUTTON_COUNT; i++) {
+    if (radioNotes[i].note != NO_NOTE) {
+      pcMask |= 1u << (radioNotes[i].note % 12);
+    }
+  }
+#endif
   if (previewNote >= 0) pcMask |= 1u << (previewNote % 12);
 
   drawPiano(pcMask);
@@ -481,10 +1195,16 @@ void drawScreen() {
   display.print(overlayUntil ? overlay : lastEvent);
 
   display.display();
+  if (Wire.getWireTimeoutFlag()) {
+    // Залипшая I2C-линия больше не останавливает MIDI навсегда. Wire timeout
+    // прерывает транзакцию, после чего отключаем дальнейшие refresh OLED.
+    Wire.clearWireTimeoutFlag();
+    hasOled = false;
+  }
 }
 
 void displayTask() {
-  if (overlayUntil && millis() > overlayUntil) {
+  if (overlayUntil && (int32_t)(millis() - overlayUntil) >= 0) {
     overlayUntil = 0;
     previewNote = -1;
     dispDirty = true;
@@ -497,7 +1217,8 @@ void displayTask() {
 }
 
 void ledTask() {
-  if (PIN_LED >= 0 && ledOffAt && millis() >= ledOffAt) {
+  if (PIN_LED >= 0 && ledOffAt &&
+      (int32_t)(millis() - ledOffAt) >= 0) {
     digitalWrite(PIN_LED, LOW);
     ledOffAt = 0;
   }
@@ -509,6 +1230,9 @@ void setup() {
   pinMode(MUX_S0, OUTPUT);
   pinMode(MUX_S1, OUTPUT);
   pinMode(MUX_S2, OUTPUT);
+  digitalWrite(MUX_S0, LOW);
+  digitalWrite(MUX_S1, LOW);
+  digitalWrite(MUX_S2, LOW);
   for (uint8_t z = 0; z < N_MUX; z++) pinMode(MUX_Z[z], INPUT);
   for (uint8_t i = 0; i < N_KEYS; i++)
     if (KEYS[i].src == 0xFE)
@@ -518,50 +1242,64 @@ void setup() {
     digitalWrite(PIN_LED, LOW);
   }
 
+  // У запаянного nRF CE не должен плавать HIGH, а CSN — случайно выбирать
+  // SPI-устройство даже в сборке без RX или до вызова radio.begin().
+  pinMode(NRF_CE_PIN, OUTPUT);
+  digitalWrite(NRF_CE_PIN, LOW);
+  pinMode(NRF_CSN_PIN, OUTPUT);
+  digitalWrite(NRF_CSN_PIN, HIGH);
+
   Serial1.begin(31250);                        // DIN/TRS MIDI OUT
 
-  setScale(0);                                 // хроматика от C3
-  for (uint8_t j = 0; j < 8; j++) sounding[j] = 0xFF;
+  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
+    sounding[j].note = NO_NOTE;
+    sounding[j].channel = 0;
+  }
   for (uint8_t i = 0; i < N_POTS; i++) {
-    potCCnum[i] = POTS[i].cc;
     potToKey[i] = -1;
   }
-  for (uint8_t j = 0; j < 8; j++) potToKey[KEY_POT[j]] = j;
+  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
+    potToKey[KEY_POT[j]] = (int8_t)j;
+  }
+
+  // Defaults применяются внутри loadSettings(); валидный блок TMD1 затем
+  // заменяет их. Ни byte 0..9, ни официальные radio IDs здесь не пишутся.
+  loadSettings();
+
+#if ENABLE_NRF_RX
+  setupRadioReceiver();
+#endif
 
   Wire.begin();
-  hasOled = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  Wire.setWireTimeout(OLED_WIRE_TIMEOUT_US, true);
+  Wire.setClock(400000UL);
+  hasOled = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR, true, false);
+  if (Wire.getWireTimeoutFlag()) {
+    Wire.clearWireTimeoutFlag();
+    hasOled = false;
+  }
   if (hasOled) {
-    Wire.setClock(400000UL);
+    // Встроенный Adafruit splash отключён build flag и не занимает flash.
+    // Первый полезный экран нарисует displayTask(); искусственной паузы
+    // 800 ms больше нет, поэтому радио и кнопки готовы практически сразу.
     display.clearDisplay();
-    display.setTextColor(SSD1306_WHITE);
-    display.setTextSize(3);
-    display.setCursor(10, 5);
-    display.print(F("TOAST"));
-    display.display();
-    delay(800);
   }
-
-#if ENABLE_NRF
-  nrfOk = radio.begin();
-  if (nrfOk) {
-    radio.setChannel(NRF_CHANNEL);
-    radio.setDataRate(RF24_1MBPS);
-    radio.setPALevel(RF24_PA_HIGH);
-    radio.setAutoAck(false);
-    radio.openWritingPipe((const uint8_t *)NRF_ADDR);
-    radio.stopListening();
-  }
-#endif
 
   // первичное чтение — без пачки событий на старте
   for (uint8_t i = 0; i < N_POTS; i++) {
     uint16_t raw = readNode(POTS[i].src, POTS[i].chan);
     potFilt[i] = raw;
-    potSent7[i] = raw >> 3;
+    potSent7[i] = (uint8_t)(raw >> 3);
+    potSentRaw[i] = raw;
   }
   latchPots();
-  for (uint8_t i = 0; i < N_POTS; i++) potArmed[i] = true;  // CC-поты живые сразу
-  potArmed[POT_VALUE] = false;  // velocity = 127, пока value-пот не тронут
+  for (uint8_t i = 0; i < N_POTS; i++) {
+    // Обычный CC-layer можно включить сразу: last-sent уже равен текущему
+    // ADC и стартовой пачки CC не будет. Если из EEPROM загружен NOTES-layer,
+    // note-поты остаются защёлкнутыми и не сотрут сохранённые назначения.
+    potArmed[i] = !swapLayers && i != POT_VALUE;
+  }
+  potArmed[POT_VALUE] = false;  // сохранённая velocity ждёт реального движения
   for (uint8_t i = 0; i < N_KEYS; i++) {
     keyState[i] = keyRead[i] = false;
     keyT[i] = 0;
@@ -569,8 +1307,16 @@ void setup() {
 }
 
 void loop() {
-  updateKeys();
+#if ENABLE_NRF_RX
+  radioTask();
+#endif
+
+  // Дебаунс сначала фиксирует единый снимок всех кнопок. Только после него
+  // вычисляется SHIFT/SETUP/ROOT, и уже затем рассылаются edges. Так результат
+  // одновременного SHIFT+кнопка не зависит от номера канала мультиплексора.
+  const uint16_t changedKeys = scanKeys();
   updateMode();
+  dispatchKeyChanges(changedKeys);
   updatePots();
   if (usbDirty) {
     MidiUSB.flush();
@@ -578,4 +1324,5 @@ void loop() {
   }
   displayTask();
   ledTask();
+  settingsTask();
 }
