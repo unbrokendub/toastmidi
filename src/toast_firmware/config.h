@@ -187,11 +187,8 @@ static const RadioButtonDef NRF_BUTTONS[NRF_BUTTON_COUNT] PROGMEM = {
 #define KEY_VELOCITY 127
 #define OVERLAY_MS 1400        // сколько держать подсказку на экране
 
-// ---- яркость OLED (контраст SSD1306) ----
-// SHIFT + KEY1(октава вверх) + VALUE-пот регулирует контраст 0x81.
-// Минимум держим выше нуля, чтобы экран не гас полностью и подсказки
-// оставались читаемыми даже на самом тусклом положении.
-#define OLED_BRIGHTNESS_DEFAULT 255
+// ---- фиксированная яркость OLED (контраст SSD1306) ----
+// Минимум держим выше нуля, чтобы экран не гас полностью.
 #define OLED_BRIGHTNESS_MIN 6
 
 // ---- harmony engine ----

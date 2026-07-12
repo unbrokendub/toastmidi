@@ -14,7 +14,7 @@
 - 3–6 голосов, inversion, Close/Wide/Drop2/Drop3 и register ±2;
 - MIDI channel 1–16, velocity и переназначаемые CC1–CC127;
 - штатная радиопанель через запаянный nRF24L01+;
-- OLED 128×32 и штатный RGB LED;
+- OLED 128×32 с постоянной минимальной яркостью и штатный RGB LED;
 - USB Serial/CDC оставлен включённым, поэтому загрузка не требует доступа к
   физической кнопке reset в нормальном режиме.
 
@@ -69,10 +69,11 @@ KEY8–POT7, KEY7–POT3, KEY3–POT8, KEY2–POT4. POT9 — VALUE.
 | POT6 | progression bank |
 | POT7 | chord register −2…+2 |
 | POT8 | VL: 0 OFF / 1 SMOOTH / 2 BASS / 3 TOP |
-| POT9 | яркость OLED |
+| POT9 | палитра P/R/L: BASIC / EXT |
 
 После входа в новый режим каждый пот ждёт реального движения: старое
 физическое положение не вызывает скачок параметра.
+POT9 и быстрая команда SHIFT + PAD8 управляют одной и той же P/R/L-палитрой.
 
 ### Быстрые SHIFT-команды
 
@@ -231,7 +232,7 @@ pio run -e toast_firmware -t upload
 
 Проверенная конфигурация: SparkFun Pro Micro 5V/16 MHz, PlatformIO
 `atmelavr@5.3.0`. USB CDC специально не отключён. Размер v0.3 на текущем
-toolchain: 28 422 / 28 672 bytes flash (99,1%), 1 382 / 2 560 bytes static
+toolchain: 28 366 / 28 672 bytes flash (98,9%), 1 374 / 2 560 bytes static
 RAM; SSD1306 framebuffer ещё 512 bytes выделяет в heap при старте.
 
 Size flags находятся в `platformio.ini`: splash SSD1306 отключён,

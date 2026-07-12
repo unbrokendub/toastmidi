@@ -12,7 +12,7 @@
  *   KEY4 + POT1..8         — MIDI CC (слои можно поменять местами)
  *   KEY4 + KEY11 + POT9    — MIDI-канал
  *   KEY4 + KEY11 + POT1..8 — CC-номер пота
- *   KEY4 + KEY1  + POT9    — яркость OLED
+ *   KEY4 + KEY1  + POT9    — палитра P/R/L BASIC / EXT
  *   KEY4 + KEY1  + POT1    — тоника (root) скейла
  *   KEY4 + KEY1 + POT2..8  — параметры harmony engine
  *
@@ -185,7 +185,6 @@ bool     swapLayers = true;     // true: поты без шифта крутят
 bool     comboLatched = false;  // защёлка комбо SHIFT+обе октавы
 int8_t   previewNote = -1;      // нота, выбираемая потом — подсветка на пиано
 uint8_t  velocity = KEY_VELOCITY;  // velocity нот, крутится value-потом в игре
-uint8_t  oledBrightness = OLED_BRIGHTNESS_DEFAULT;  // контраст SSD1306 0..255
 
 uint8_t  chordProfile = 0;
 uint8_t  chordInversion = 0;
@@ -251,7 +250,7 @@ char     lastEvent[22] = "TOAST v0.3";
 #if ENABLE_SETTINGS_PERSISTENCE
 // На little-endian AVR эти четыре байта лежат как ASCII "TMD1".
 constexpr uint32_t SETTINGS_MAGIC = 0x31444D54UL;
-constexpr uint8_t SETTINGS_VERSION = 3;  // v3: relative anchors + int8 cache
+constexpr uint8_t SETTINGS_VERSION = 4;  // v4: fixed OLED brightness
 constexpr uint8_t SETTINGS_FLAG_SWAP_LAYERS = 0x01;
 
 struct __attribute__((packed)) StoredSettings {
@@ -264,7 +263,6 @@ struct __attribute__((packed)) StoredSettings {
   uint8_t channel;
   uint8_t noteVelocity;
   uint8_t flags;
-  uint8_t brightness;
   uint8_t potCc[N_POTS];
   int8_t keyRel[N_NOTE_KEYS];
   int8_t keyStep[N_NOTE_KEYS];
@@ -489,7 +487,6 @@ void setDefaultSettings() {
   midiCh = MIDI_CH;
   velocity = KEY_VELOCITY;
   swapLayers = true;
-  oledBrightness = OLED_BRIGHTNESS_DEFAULT;
   chordProfile = 0;
   chordInversion = 0;
   chordVoiceCount = CHORD_VOICES;
@@ -567,8 +564,6 @@ void loadSettings() {
   // swapLayers сознательно НЕ восстанавливаем из EEPROM: прибор всегда
   // стартует в нот-слое (см. setDefaultSettings), а SHIFT+обе октавы даёт
   // временное переключение в CC на сессию.
-  oledBrightness = saved.brightness;
-  if (oledBrightness < OLED_BRIGHTNESS_MIN) oledBrightness = OLED_BRIGHTNESS_MIN;
   for (uint8_t i = 0; i < N_POTS; i++) potCCnum[i] = saved.potCc[i];
   for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
     keyRelSemitone[j] = saved.keyRel[j];
@@ -587,7 +582,6 @@ void snapshotSettings() {
   pendingSettings.channel = midiCh;
   pendingSettings.noteVelocity = velocity;
   pendingSettings.flags = swapLayers ? SETTINGS_FLAG_SWAP_LAYERS : 0;
-  pendingSettings.brightness = oledBrightness;
   for (uint8_t i = 0; i < N_POTS; i++) pendingSettings.potCc[i] = potCCnum[i];
   for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
     pendingSettings.keyRel[j] = keyRelSemitone[j];
@@ -1526,8 +1520,18 @@ uint8_t buildHarmonyChord(uint8_t key, uint8_t octMask, uint8_t *out) {
   return 0;
 }
 
+void selectPlrPalette(bool extended) {
+  if (extended == plrExtended) return;
+  plrExtended = extended;
+  char b[6];
+  char *p = putStr(b, "PLR ");
+  *p++ = plrExtended ? 'E' : 'B';
+  *p = 0;
+  setOverlay(b);
+}
+
 void latchNoteAssignmentPots();
-void applyBrightness();
+void applyMinimumBrightness();
 
 void onKeyChange(uint8_t idx, bool down) {
   if (idx == BTN_SHIFT) { dispDirty = true; return; }
@@ -1583,12 +1587,7 @@ void onKeyChange(uint8_t idx, bool down) {
         *putU(putStr(b, "PROFILE "), (uint16_t)(chordProfile + 1)) = 0;
         setOverlay(b);
       } else if (j == 7) {
-        plrExtended = !plrExtended;
-        char b[6];
-        char *p = putStr(b, "PLR ");
-        *p++ = plrExtended ? 'E' : 'B';
-        *p = 0;
-        setOverlay(b);
+        selectPlrPalette(!plrExtended);
       }
     }
   } else {
@@ -1823,16 +1822,8 @@ void updatePots() {
         break;
 
       case M_ROOT:
-        if (i == POT_VALUE) {                    // VALUE-пот = яркость OLED
-          uint8_t bv = (uint8_t)(f >> 2);        // 0..255
-          if (bv < OLED_BRIGHTNESS_MIN) bv = OLED_BRIGHTNESS_MIN;
-          if (bv != oledBrightness) {
-            oledBrightness = bv;
-            applyBrightness();
-            markSettingsDirty();
-            *putU(putStr(b, "BRIGHT "), oledBrightness) = 0;
-            setOverlay(b);
-          }
+        if (i == POT_VALUE) {                    // VALUE = P/R/L BASIC / EXT
+          selectPlrPalette(f >= 512);
         } else if (i == 0) {                      // POT1 = тоника (перенесена с VALUE)
           uint8_t r = (uint8_t)(((uint32_t)f * 12) >> 10);
           if (r >= 12) r = 11;
@@ -2015,10 +2006,10 @@ void drawScreen() {
   display.print(overlayUntil ? overlay : lastEvent);
 }
 
-void applyBrightness() {
+void applyMinimumBrightness() {
   if (!hasOled) return;
   Wire.setClock(OLED_I2C_HZ);
-  const uint8_t command[] = {SSD1306_SETCONTRAST, oledBrightness};
+  const uint8_t command[] = {SSD1306_SETCONTRAST, OLED_BRIGHTNESS_MIN};
   oledWireWrite(0x00, command, sizeof(command));
 }
 
@@ -2104,7 +2095,7 @@ void setup() {
     // Первый полезный экран нарисует displayTask(); искусственной паузы
     // 800 ms больше нет, поэтому радио и кнопки готовы практически сразу.
     display.clearDisplay();
-    applyBrightness();          // восстановить сохранённую яркость
+    applyMinimumBrightness();   // постоянный минимальный контраст
     oledTxSlot = OLED_PAGE_COUNT;
   }
 
