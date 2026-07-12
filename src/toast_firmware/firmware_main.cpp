@@ -9,7 +9,8 @@
  *   KEY4 + POT1..8         — нота закреплённой кнопки (внутри скейла)
  *   KEY4 + KEY11 + POT9    — MIDI-канал
  *   KEY4 + KEY11 + POT1..8 — CC-номер пота
- *   KEY4 + KEY1  + POT9    — тоника (root) скейла
+ *   KEY4 + KEY1  + POT9    — яркость OLED
+ *   KEY4 + KEY1  + POT1    — тоника (root) скейла
  *   POT1..8 без шифта      — MIDI CC (по умолчанию CC1..CC8)
  *
  * Все события идут в USB-MIDI и в DIN/TRS MIDI OUT одновременно.
@@ -143,10 +144,11 @@ uint8_t  potCCnum[N_POTS];       // CC-номер каждого пота
 int8_t   potToKey[N_POTS];       // обратная карта: пот -> игровая кнопка
 
 Mode     mode = M_PLAY;
-bool     swapLayers = false;    // true: поты без шифта крутят ноты, CC — под шифтом
+bool     swapLayers = true;     // true: поты без шифта крутят ноты, CC — под шифтом
 bool     comboLatched = false;  // защёлка комбо SHIFT+обе октавы
 int8_t   previewNote = -1;      // нота, выбираемая потом — подсветка на пиано
 uint8_t  velocity = KEY_VELOCITY;  // velocity нот, крутится value-потом в игре
+uint8_t  oledBrightness = OLED_BRIGHTNESS_DEFAULT;  // контраст SSD1306 0..255
 
 uint16_t potFilt[N_POTS];
 uint16_t potLatch[N_POTS];
@@ -158,22 +160,29 @@ bool     keyState[N_KEYS];      // подтверждённые состояни
 bool     keyRead[N_KEYS];
 uint32_t keyT[N_KEYS];
 
-// У каждого источника запоминается не только высота, но и MIDI-канал,
-// на котором был отправлен Note On. Поэтому смена канала при удержанной
-// кнопке больше не оставляет зависшую ноту на старом канале.
-struct HeldNote {
-  uint8_t note;
+// Каждый источник (кнопка корпуса или радио) может держать до CHORD_VOICES
+// нот: одиночную ноту в обычной игре или целый аккорд под модификатором
+// октавы. Канал запоминается вместе с нотами, поэтому смена MIDI-канала при
+// удержании не оставляет зависших нот на старом канале.
+struct HeldNotes {
+  uint8_t note[CHORD_VOICES];    // NO_NOTE = пустой голос
   uint8_t channel;
 };
 constexpr uint8_t NO_NOTE = 0xFF;
-HeldNote sounding[N_NOTE_KEYS];
+HeldNotes sounding[N_NOTE_KEYS];
+
+// Октавные кнопки срабатывают на ОТПУСКАНИЕ (тап = сдвиг октавы), а удержание
+// служит модификатором аккордов. Флаг помечает, что удержание уже «потрачено»
+// на аккорд или режим, и тогда на отпускании октава не сдвигается.
+// [0] = октава вниз (Set A), [1] = октава вверх (Set B).
+bool octConsumed[2] = {false, false};
 
 #if ENABLE_NRF_RX
 // Радиокнопка является самостоятельным источником: она может удерживаться
 // одновременно с кнопкой корпуса. Отдельное состояние также подавляет
 // повторы одинакового PRESS/RELEASE, которые пульт может посылать для
 // надёжности доставки.
-HeldNote radioNotes[NRF_BUTTON_COUNT];
+HeldNotes radioNotes[NRF_BUTTON_COUNT];
 bool     radioDown[NRF_BUTTON_COUNT];
 uint8_t  radioCcChannel[NRF_BUTTON_COUNT];
 uint32_t radioPressedAt[NRF_BUTTON_COUNT];
@@ -191,7 +200,7 @@ char     lastEvent[22] = "TOAST v0.2";
 
 // На little-endian AVR эти четыре байта лежат как ASCII "TMD1".
 constexpr uint32_t SETTINGS_MAGIC = 0x31444D54UL;
-constexpr uint8_t SETTINGS_VERSION = 1;
+constexpr uint8_t SETTINGS_VERSION = 2;  // v2: добавлено поле brightness
 constexpr uint8_t SETTINGS_FLAG_SWAP_LAYERS = 0x01;
 
 struct __attribute__((packed)) StoredSettings {
@@ -204,6 +213,7 @@ struct __attribute__((packed)) StoredSettings {
   uint8_t channel;
   uint8_t noteVelocity;
   uint8_t flags;
+  uint8_t brightness;
   uint8_t potCc[N_POTS];
   int16_t keyStep[N_NOTE_KEYS];
   uint16_t crc;
@@ -226,8 +236,26 @@ static_assert(SETTINGS_EEPROM_START + sizeof(StoredSettings) <=
 
 // ================== утилиты ==================
 
+// Лёгкая сборка коротких строк без snprintf. Один вызов snprintf тянет
+// avr-libc vfprintf (~900 байт flash); эти три хелпера убирают эту
+// зависимость целиком. Вызывающий обязан завершить строку '\0'.
+char *putStr(char *p, const char *s) { while (*s) *p++ = *s++; return p; }
+char *putU(char *p, uint16_t v) {
+  char t[5];
+  uint8_t n = 0;
+  do { t[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+  while (n) *p++ = t[--n];
+  return p;
+}
+char *putI(char *p, int16_t v) {
+  if (v < 0) { *p++ = '-'; v = (int16_t)-v; }
+  return putU(p, (uint16_t)v);
+}
+
 void fmtNote(char *out, uint8_t n) {          // "C#3" (C3 = MIDI 60)
-  snprintf(out, 5, "%s%d", NOTE_NAMES[n % 12], n / 12 - 2);
+  char *p = putStr(out, NOTE_NAMES[n % 12]);
+  p = putI(p, (int16_t)(n / 12) - 2);
+  *p = 0;
 }
 
 // Деление вниз, а не к нулю. Обычный C/C++ operator / для отрицательных
@@ -272,7 +300,15 @@ void setScale(uint8_t s) {
   ladderMin++;
   ladderMax = 0;
   while (ladderNote(ladderMax + 1) <= 127) ladderMax++;
-  resetLadder();
+
+  // Назначения кнопок СОХРАНЯЕМ при смене скейла/тоники: держим ту же
+  // ступень-индекс каждой кнопки (в новом скейле она озвучится по-новому),
+  // только подрезаем в допустимый диапазон. Полный сброс к дефолту делает
+  // отдельно resetLadder() — при старте defaults и по комбо NOTES RESET.
+  for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
+    if (keyLadder[j] < ladderMin) keyLadder[j] = ladderMin;
+    else if (keyLadder[j] > ladderMax) keyLadder[j] = ladderMax;
+  }
 }
 
 void setOverlay(const char *s) {
@@ -283,13 +319,20 @@ void setOverlay(const char *s) {
   dispDirty = true;
 }
 
+bool heldEmpty(const HeldNotes &h) {
+  for (uint8_t v = 0; v < CHORD_VOICES; v++) {
+    if (h.note[v] != NO_NOTE) return false;
+  }
+  return true;
+}
+
 bool anyNotesHeld() {
   for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
-    if (sounding[j].note != NO_NOTE) return true;
+    if (!heldEmpty(sounding[j])) return true;
   }
 #if ENABLE_NRF_RX
   for (uint8_t i = 0; i < NRF_BUTTON_COUNT; i++) {
-    if (radioNotes[i].note != NO_NOTE) return true;
+    if (!heldEmpty(radioNotes[i])) return true;
   }
 #endif
   return false;
@@ -315,8 +358,10 @@ void setDefaultSettings() {
   octOffset = 0;
   midiCh = MIDI_CH;
   velocity = KEY_VELOCITY;
-  swapLayers = false;
+  swapLayers = true;              // по умолчанию поты крутят НОТЫ, CC — под шифтом
+  oledBrightness = OLED_BRIGHTNESS_DEFAULT;
   setScale(0);
+  resetLadder();                  // дефолтная раскладка кнопок (setScale её не трогает)
   for (uint8_t i = 0; i < N_POTS; i++) potCCnum[i] = POTS[i].cc;
 }
 
@@ -360,7 +405,11 @@ void loadSettings() {
   octOffset = saved.octave;
   midiCh = saved.channel;
   velocity = saved.noteVelocity;
-  swapLayers = saved.flags & SETTINGS_FLAG_SWAP_LAYERS;
+  // swapLayers сознательно НЕ восстанавливаем из EEPROM: прибор всегда
+  // стартует в нот-слое (см. setDefaultSettings), а SHIFT+обе октавы даёт
+  // временное переключение в CC на сессию.
+  oledBrightness = saved.brightness;
+  if (oledBrightness < OLED_BRIGHTNESS_MIN) oledBrightness = OLED_BRIGHTNESS_MIN;
   for (uint8_t i = 0; i < N_POTS; i++) potCCnum[i] = saved.potCc[i];
   for (uint8_t j = 0; j < N_NOTE_KEYS; j++) keyLadder[j] = saved.keyStep[j];
 }
@@ -376,6 +425,7 @@ void snapshotSettings() {
   pendingSettings.channel = midiCh;
   pendingSettings.noteVelocity = velocity;
   pendingSettings.flags = swapLayers ? SETTINGS_FLAG_SWAP_LAYERS : 0;
+  pendingSettings.brightness = oledBrightness;
   for (uint8_t i = 0; i < N_POTS; i++) pendingSettings.potCc[i] = potCCnum[i];
   for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
     pendingSettings.keyStep[j] = keyLadder[j];
@@ -488,7 +538,11 @@ void sendCCOnChannel(uint8_t channel, uint8_t cc, uint8_t val) {
   MidiUSB.sendMIDI(p);
   usbDirty = true;
   ledFlash();
-  snprintf(lastEvent, sizeof(lastEvent), "CC%u = %u", cc, val);
+  char *q = putStr(lastEvent, "CC");
+  q = putU(q, cc);
+  q = putStr(q, " = ");
+  q = putU(q, val);
+  *q = 0;
   dispDirty = true;
 }
 
@@ -506,25 +560,30 @@ void sendNoteEvent(uint8_t channel, uint8_t note, bool on) {
   usbDirty = true;
   ledFlash();
   if (on) {
-    char nm[5];
-    fmtNote(nm, note);
-    snprintf(lastEvent, sizeof(lastEvent), "%s", nm);
+    fmtNote(lastEvent, note);
   }
   dispDirty = true;
 }
 
+bool sourceHoldsNote(const HeldNotes &h, uint8_t note, uint8_t channel) {
+  if (h.channel != channel) return false;
+  for (uint8_t v = 0; v < CHORD_VOICES; v++) {
+    if (h.note[v] == note) return true;
+  }
+  return false;
+}
+
 bool anotherSourceHolds(uint8_t note, uint8_t channel,
-                        const HeldNote *ignore) {
+                        const HeldNotes *ignore) {
   for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
-    if (&sounding[j] != ignore && sounding[j].note == note &&
-        sounding[j].channel == channel) {
+    if (&sounding[j] != ignore && sourceHoldsNote(sounding[j], note, channel)) {
       return true;
     }
   }
 #if ENABLE_NRF_RX
   for (uint8_t i = 0; i < NRF_BUTTON_COUNT; i++) {
-    if (&radioNotes[i] != ignore && radioNotes[i].note == note &&
-        radioNotes[i].channel == channel) {
+    if (&radioNotes[i] != ignore &&
+        sourceHoldsNote(radioNotes[i], note, channel)) {
       return true;
     }
   }
@@ -532,27 +591,35 @@ bool anotherSourceHolds(uint8_t note, uint8_t channel,
   return false;
 }
 
-void pressNoteSource(HeldNote &held, uint8_t note) {
-  if (held.note != NO_NOTE) return;
-  held.note = note;
+// Нажать до CHORD_VOICES нот как один источник. count==1 — обычная нота.
+void pressNoteSet(HeldNotes &held, const uint8_t *notes, uint8_t count) {
+  if (!heldEmpty(held)) return;                 // источник уже держит что-то
   held.channel = midiCh;
-
-  // Две разные физические кнопки могут быть назначены одной ноте. Второй
-  // Note On не нужен; Note Off уйдёт только после отпускания последнего
-  // источника с той же парой note/channel.
-  if (!anotherSourceHolds(note, held.channel, &held)) {
-    sendNoteEvent(held.channel, note, true);
+  for (uint8_t v = 0; v < CHORD_VOICES; v++) {
+    held.note[v] = (v < count) ? notes[v] : NO_NOTE;
+  }
+  // Note On шлём только для нот, которых не держит другой источник, чтобы
+  // повторной высоты не было. ignore=&held: собственные ноты не считаем.
+  for (uint8_t v = 0; v < count; v++) {
+    if (!anotherSourceHolds(held.note[v], held.channel, &held)) {
+      sendNoteEvent(held.channel, held.note[v], true);
+    }
   }
 }
 
-void releaseNoteSource(HeldNote &held) {
-  if (held.note == NO_NOTE) return;
-  const uint8_t note = held.note;
-  const uint8_t channel = held.channel;
-  held.note = NO_NOTE;
+void pressNoteSource(HeldNotes &held, uint8_t note) {
+  pressNoteSet(held, &note, 1);
+}
 
-  if (!anotherSourceHolds(note, channel, nullptr)) {
-    sendNoteEvent(channel, note, false);
+void releaseNoteSource(HeldNotes &held) {
+  const uint8_t channel = held.channel;
+  for (uint8_t v = 0; v < CHORD_VOICES; v++) {
+    const uint8_t note = held.note[v];
+    if (note == NO_NOTE) continue;
+    held.note[v] = NO_NOTE;                      // очищаем ДО проверки dedup
+    if (!anotherSourceHolds(note, channel, nullptr)) {
+      sendNoteEvent(channel, note, false);
+    }
   }
 }
 
@@ -815,7 +882,7 @@ void processRadioPayload(const uint8_t *payload) {
 void setupRadioReceiver() {
   readOfficialKeypadIds();
   for (uint8_t i = 0; i < NRF_BUTTON_COUNT; i++) {
-    radioNotes[i].note = NO_NOTE;
+    for (uint8_t v = 0; v < CHORD_VOICES; v++) radioNotes[i].note[v] = NO_NOTE;
     radioNotes[i].channel = 0;
     radioDown[i] = false;
     radioCcChannel[i] = midiCh;
@@ -826,10 +893,10 @@ void setupRadioReceiver() {
   nrfOk = NrfRx::spiSelfTest() && NrfRx::configure();
   if (!nrfOk) {
     digitalWrite(NRF_CE_PIN, LOW);
-    snprintf(lastEvent, sizeof(lastEvent), "NRF NOT FOUND");
+    *putStr(lastEvent, "NRF NOT FOUND") = 0;
     return;
   }
-  snprintf(lastEvent, sizeof(lastEvent), "RADIO READY");
+  *putStr(lastEvent, "RADIO READY") = 0;
 }
 
 void radioTask() {
@@ -874,13 +941,32 @@ int8_t noteKeyIndexOf(uint8_t keyIdx) {
   return -1;
 }
 
+// Собрать аккорд для игровой кнопки j по таблице смещений в ступенях скейла.
+// Все голоса берутся из текущего скейла, поэтому любой аккорд в тональности.
+// Смещение 127 (0x7F) в слоте пропускает голос. Возвращает число нот.
+uint8_t buildChord(uint8_t j, const int8_t *offsets, uint8_t *out) {
+  const int16_t baseK = keyLadder[j];
+  uint8_t n = 0;
+  for (uint8_t v = 0; v < CHORD_VOICES; v++) {
+    if (offsets[v] == 127) continue;
+    int16_t note = ladderNote(baseK + offsets[v]) + 12 * octOffset;
+    if (note < 0 || note > 127) continue;    // крайний голос отбрасываем, не «складываем»
+    out[n++] = (uint8_t)note;
+  }
+  return n;
+}
+
 void latchNoteAssignmentPots();
+void applyBrightness();
 
 void onKeyChange(uint8_t idx, bool down) {
   if (idx == BTN_SHIFT) { dispDirty = true; return; }
 
   if (idx == BTN_OCT_DOWN || idx == BTN_OCT_UP) {
-    if (down && !keyState[BTN_SHIFT]) {          // без шифта — октава
+    const uint8_t k = (idx == BTN_OCT_UP) ? 1 : 0;
+    // Сброс флага «потрачено» на нажатии делает dispatchKeyChanges (до нот).
+    // Здесь — только отпускание: короткий тап без шифта и без аккордов сдвигает октаву.
+    if (!down && !octConsumed[k] && !keyState[BTN_SHIFT]) {
       const int8_t delta = (idx == BTN_OCT_UP) ? 1 : -1;
       const int8_t nextOctave = (int8_t)(octOffset + delta);
       if (nextOctave >= -3 && nextOctave <= 3) {
@@ -888,7 +974,10 @@ void onKeyChange(uint8_t idx, bool down) {
         markSettingsDirty();
       }
       char b[16];
-      snprintf(b, sizeof(b), "OCTAVE %+d", octOffset);
+      char *p = putStr(b, "OCTAVE ");
+      if (octOffset >= 0) *p++ = '+';
+      p = putI(p, octOffset);
+      *p = 0;
       setOverlay(b);
     }
     return;
@@ -899,7 +988,18 @@ void onKeyChange(uint8_t idx, bool down) {
 
   if (down) {
     if (mode == M_PLAY) {
-      pressNoteSource(sounding[j], playedNote((uint8_t)j));
+      // Удержание октавной кнопки без шифта превращает нот-кнопку в аккорд.
+      const bool chordDown = !keyState[BTN_SHIFT] && keyState[BTN_OCT_DOWN];
+      const bool chordUp = !keyState[BTN_SHIFT] && keyState[BTN_OCT_UP];
+      if (chordDown || chordUp) {
+        octConsumed[chordDown ? 0 : 1] = true;   // октаву «потратили» на аккорд
+        uint8_t chord[CHORD_VOICES];
+        const uint8_t n =
+            buildChord((uint8_t)j, chordDown ? CHORD_SET_A : CHORD_SET_B, chord);
+        pressNoteSet(sounding[j], chord, n);
+      } else {
+        pressNoteSource(sounding[j], playedNote((uint8_t)j));
+      }
     } else if (mode == M_SHIFT && j == 0) {      // SHIFT + первая кнопка
       resetLadder();
       // Уже активированные note-поты не должны на следующем loop молча
@@ -937,6 +1037,16 @@ uint16_t scanKeys() {
 }
 
 void dispatchKeyChanges(uint16_t changed) {
+  // Свежее нажатие октавной кнопки обнуляет флаг «потрачено» — но ДО раздачи
+  // нот в этом же скане, иначе аккорд (индекс нот-кнопки может быть меньше)
+  // затёрся бы поздним обработчиком октавы. Шифт при нажатии = сразу режим.
+  if ((changed & ((uint16_t)1 << BTN_OCT_DOWN)) && keyState[BTN_OCT_DOWN]) {
+    octConsumed[0] = keyState[BTN_SHIFT];
+  }
+  if ((changed & ((uint16_t)1 << BTN_OCT_UP)) && keyState[BTN_OCT_UP]) {
+    octConsumed[1] = keyState[BTN_SHIFT];
+  }
+
   // Сначала все нажатия, затем отпускания. Если в одном скане одна кнопка
   // передала ноту другой кнопке с тем же pitch, это не создаст короткую
   // лишнюю пару Note Off/Note On посередине.
@@ -977,7 +1087,7 @@ void updateMode() {
     comboLatched = true;
     swapLayers = !swapLayers;
     latchPots();
-    markSettingsDirty();
+    // слой не сохраняем — переключение действует только до перезагрузки
     setOverlay(swapLayers ? "POTS = NOTES" : "POTS = CC");
   } else if (!combo) {
     comboLatched = false;
@@ -986,8 +1096,8 @@ void updateMode() {
   Mode m = M_PLAY;
   if (keyState[BTN_SHIFT]) {
     m = M_SHIFT;
-    if (keyState[BTN_OCT_DOWN]) m = M_SETUP;
-    else if (keyState[BTN_OCT_UP]) m = M_ROOT;
+    if (keyState[BTN_OCT_DOWN]) { m = M_SETUP; octConsumed[0] = true; }
+    else if (keyState[BTN_OCT_UP]) { m = M_ROOT; octConsumed[1] = true; }
   }
   if (m != mode) {
     mode = m;
@@ -1020,7 +1130,11 @@ void assignKeyNote(uint8_t j, uint16_t filt) {
   char b[20], nm[5];
   uint8_t pn = playedNote(j);
   fmtNote(nm, pn);
-  snprintf(b, sizeof(b), "BTN%u = %s", j + 1, nm);
+  char *p = putStr(b, "BTN");
+  p = putU(p, (uint16_t)(j + 1));
+  p = putStr(p, " = ");
+  p = putStr(p, nm);
+  *p = 0;
   setOverlay(b);
   previewNote = (int8_t)pn;     // показать выбираемую ноту и на клавиатуре
 }
@@ -1047,7 +1161,7 @@ void updatePots() {
           if (v != velocity) {
             velocity = v;
             markSettingsDirty();
-            snprintf(b, sizeof(b), "VELOCITY %u", velocity);
+            *putU(putStr(b, "VELOCITY "), velocity) = 0;
             setOverlay(b);
           }
           break;
@@ -1073,8 +1187,7 @@ void updatePots() {
               setScale(s);
               if (!swapLayers) latchNoteAssignmentPots();
               markSettingsDirty();
-              snprintf(b, sizeof(b), "%s", curScale.name);
-              setOverlay(b);
+              setOverlay(curScale.name);
             }
           }
         } else if (swapLayers) {
@@ -1090,7 +1203,7 @@ void updatePots() {
           if (c != midiCh) {
             midiCh = c;
             markSettingsDirty();
-            snprintf(b, sizeof(b), "CHANNEL %u", midiCh + 1);
+            *putU(putStr(b, "CHANNEL "), (uint16_t)(midiCh + 1)) = 0;
             setOverlay(b);
           }
         } else {
@@ -1098,21 +1211,36 @@ void updatePots() {
           if (cc != potCCnum[i]) {
             potCCnum[i] = cc;
             markSettingsDirty();
-            snprintf(b, sizeof(b), "POT%u > CC%u", i + 1, cc);
+            char *p = putStr(b, "POT");
+            p = putU(p, (uint16_t)(i + 1));
+            p = putStr(p, " > CC");
+            p = putU(p, cc);
+            *p = 0;
             setOverlay(b);
           }
         }
         break;
 
       case M_ROOT:
-        if (i == POT_VALUE) {
+        if (i == POT_VALUE) {                    // VALUE-пот = яркость OLED
+          uint8_t bv = (uint8_t)(f >> 2);        // 0..255
+          if (bv < OLED_BRIGHTNESS_MIN) bv = OLED_BRIGHTNESS_MIN;
+          if (bv != oledBrightness) {
+            oledBrightness = bv;
+            applyBrightness();
+            markSettingsDirty();
+            *putU(putStr(b, "BRIGHT "), oledBrightness) = 0;
+            setOverlay(b);
+          }
+        } else if (i == 0) {                      // POT1 = тоника (перенесена с VALUE)
           uint8_t r = (uint8_t)(((uint32_t)f * 12) >> 10);
+          if (r >= 12) r = 11;
           if (r != rootPC) {
             rootPC = r;
             setScale(scaleIdx);                  // пересчёт лестницы
             if (!swapLayers) latchNoteAssignmentPots();
             markSettingsDirty();
-            snprintf(b, sizeof(b), "ROOT %s", NOTE_NAMES[rootPC]);
+            *putStr(putStr(b, "ROOT "), NOTE_NAMES[rootPC]) = 0;
             setOverlay(b);
           }
         }
@@ -1155,14 +1283,15 @@ void drawScreen() {
 
   uint16_t pcMask = 0;
   for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
-    if (sounding[j].note != NO_NOTE) {
-      pcMask |= 1u << (sounding[j].note % 12);
+    for (uint8_t v = 0; v < CHORD_VOICES; v++) {
+      if (sounding[j].note[v] != NO_NOTE) pcMask |= 1u << (sounding[j].note[v] % 12);
     }
   }
 #if ENABLE_NRF_RX
   for (uint8_t i = 0; i < NRF_BUTTON_COUNT; i++) {
-    if (radioNotes[i].note != NO_NOTE) {
-      pcMask |= 1u << (radioNotes[i].note % 12);
+    for (uint8_t v = 0; v < CHORD_VOICES; v++) {
+      if (radioNotes[i].note[v] != NO_NOTE)
+        pcMask |= 1u << (radioNotes[i].note[v] % 12);
     }
   }
 #endif
@@ -1201,6 +1330,12 @@ void drawScreen() {
     Wire.clearWireTimeoutFlag();
     hasOled = false;
   }
+}
+
+void applyBrightness() {
+  if (!hasOled) return;
+  display.ssd1306_command(SSD1306_SETCONTRAST);
+  display.ssd1306_command(oledBrightness);
 }
 
 void displayTask() {
@@ -1252,7 +1387,7 @@ void setup() {
   Serial1.begin(31250);                        // DIN/TRS MIDI OUT
 
   for (uint8_t j = 0; j < N_NOTE_KEYS; j++) {
-    sounding[j].note = NO_NOTE;
+    for (uint8_t v = 0; v < CHORD_VOICES; v++) sounding[j].note[v] = NO_NOTE;
     sounding[j].channel = 0;
   }
   for (uint8_t i = 0; i < N_POTS; i++) {
@@ -1283,6 +1418,7 @@ void setup() {
     // Первый полезный экран нарисует displayTask(); искусственной паузы
     // 800 ms больше нет, поэтому радио и кнопки готовы практически сразу.
     display.clearDisplay();
+    applyBrightness();          // восстановить сохранённую яркость
   }
 
   // первичное чтение — без пачки событий на старте
