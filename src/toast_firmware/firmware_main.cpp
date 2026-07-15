@@ -832,10 +832,19 @@ enum LedColor : uint8_t {
 
 uint8_t ledBaseColor = LED_GREEN;
 
+static_assert(PIN_LED_R == 5 && PIN_LED_G == 6 && PIN_LED_B == 7,
+              "low-current RGB uses the fixed D5/D6/D7 port map");
+
 void rgbWrite(uint8_t color) {
-  digitalWrite(PIN_LED_R, color & LED_RED ? HIGH : LOW);
-  digitalWrite(PIN_LED_G, color & LED_GREEN ? HIGH : LOW);
-  digitalWrite(PIN_LED_B, color & LED_BLUE ? HIGH : LOW);
+  // Фиксированная минимальная яркость без PWM: включённый канал переводим
+  // во вход со слабой pull-up, выключенный — в OUTPUT LOW. D7 не имеет PWM,
+  // поэтому этот режим одинаков для всех цветов и не занимает таймеры.
+  if (color & LED_RED) { DDRC &= ~_BV(6); PORTC |= _BV(6); }
+  else { PORTC &= ~_BV(6); DDRC |= _BV(6); }
+  if (color & LED_GREEN) { DDRD &= ~_BV(7); PORTD |= _BV(7); }
+  else { PORTD &= ~_BV(7); DDRD |= _BV(7); }
+  if (color & LED_BLUE) { DDRE &= ~_BV(6); PORTE |= _BV(6); }
+  else { PORTE &= ~_BV(6); DDRE |= _BV(6); }
 }
 
 void updateLedBase() {
