@@ -830,32 +830,28 @@ enum LedColor : uint8_t {
   LED_WHITE = LED_RED | LED_GREEN | LED_BLUE
 };
 
-uint8_t ledBaseColor = LED_GREEN;
+uint8_t ledBaseColor = LED_RED;
 
-static_assert(PIN_LED_R == 5 && PIN_LED_G == 6 && PIN_LED_B == 7,
-              "low-current RGB uses the fixed D5/D6/D7 port map");
+static_assert(PIN_LED_R == 7 && PIN_LED_G == 6 && PIN_LED_B == 5,
+              "low-current RGB uses the fixed D7/D6/D5 port map");
 
 void rgbWrite(uint8_t color) {
   // Фиксированная минимальная яркость без PWM: включённый канал переводим
   // во вход со слабой pull-up, выключенный — в OUTPUT LOW. D7 не имеет PWM,
   // поэтому этот режим одинаков для всех цветов и не занимает таймеры.
-  if (color & LED_RED) { DDRC &= ~_BV(6); PORTC |= _BV(6); }
-  else { PORTC &= ~_BV(6); DDRC |= _BV(6); }
+  if (color & LED_RED) { DDRE &= ~_BV(6); PORTE |= _BV(6); }
+  else { PORTE &= ~_BV(6); DDRE |= _BV(6); }
   if (color & LED_GREEN) { DDRD &= ~_BV(7); PORTD |= _BV(7); }
   else { PORTD &= ~_BV(7); DDRD |= _BV(7); }
-  if (color & LED_BLUE) { DDRE &= ~_BV(6); PORTE |= _BV(6); }
-  else { PORTE &= ~_BV(6); DDRE |= _BV(6); }
+  if (color & LED_BLUE) { DDRC &= ~_BV(6); PORTC |= _BV(6); }
+  else { PORTC &= ~_BV(6); DDRC |= _BV(6); }
 }
 
 void updateLedBase() {
-#if ENABLE_NRF_RX
-  if (!nrfOk) ledBaseColor = LED_RED;
-  else
-#endif
   if (mode == M_SETUP) ledBaseColor = LED_MAGENTA;
-  else if (mode == M_ROOT) ledBaseColor = LED_BLUE;
+  else if (mode == M_ROOT) ledBaseColor = LED_GREEN;
   else if (mode == M_SHIFT) ledBaseColor = LED_YELLOW;
-  else ledBaseColor = swapLayers ? LED_GREEN : LED_CYAN;
+  else ledBaseColor = LED_RED;
   if (!ledOffAt) rgbWrite(ledBaseColor);
 }
 

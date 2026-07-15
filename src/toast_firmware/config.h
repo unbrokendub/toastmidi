@@ -79,9 +79,9 @@ static const uint8_t KEY_TO_NOTE[] PROGMEM = {
 
 #define POT_VALUE 8          // POT9 — селектор VALUE
 
-#define PIN_LED_R 5          // три ноги штатного RGB LED (active HIGH)
+#define PIN_LED_R 7          // три ноги штатного RGB LED (active HIGH)
 #define PIN_LED_G 6
-#define PIN_LED_B 7
+#define PIN_LED_B 5
 
 // На этой фиксированной распиновке rgbWrite() питает включённые каналы через
 // внутренние pull-up ATmega32U4: постоянная минимальная яркость без PWM/UI.
