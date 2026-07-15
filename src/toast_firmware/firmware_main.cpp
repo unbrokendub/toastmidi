@@ -162,6 +162,12 @@ const char *const NOTE_NAMES[12] = {
   "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
 };
 
+// 0..7 = ChordQuality, 8..13 = scale-profile. Null-packed и в PROGMEM:
+// названия нужны только при chord press, поэтому RAM/offset table не тратим.
+const char CHORD_LABELS[] PROGMEM =
+  "maj\0" "m\0" "7\0" "maj7\0" "m7\0" "dim\0" "m7b5\0" "aug\0"
+  " W9\0" " OPEN\0" " 13N11\0" " SH9\0" " 4TH\0" " 5TH";
+
 // ================== состояние ==================
 
 enum Mode : uint8_t { M_PLAY, M_SHIFT, M_SETUP, M_ROOT };
@@ -198,6 +204,7 @@ uint8_t  previousVoicing[CHORD_VOICES];
 uint8_t  previousVoiceCount = 0;
 // bit7 = minor, low nibble = root pitch class 0..11.
 uint8_t  neoState = NEO_INVALID;
+uint8_t  chordCaption = 0;      // high nibble = label, low nibble = root PC
 
 uint16_t potFilt[N_POTS];
 uint16_t potLatch[N_POTS];
@@ -308,6 +315,14 @@ void fmtNote(char *out, uint8_t n) {          // "C#3" (C3 = MIDI 60)
   char *p = putStr(out, NOTE_NAMES[n % 12]);
   p = putI(p, (int16_t)(n / 12) - 2);
   *p = 0;
+}
+
+char *putChordLabel(char *p, uint8_t index) {
+  PGM_P s = CHORD_LABELS;
+  while (index--) while (pgm_read_byte(s++)) {}
+  char c;
+  while ((c = (char)pgm_read_byte(s++))) *p++ = c;
+  return p;
 }
 
 // Деление вниз, а не к нулю. Обычный C/C++ operator / для отрицательных
@@ -452,6 +467,13 @@ void setOverlay(const char *s) {
   overlay[sizeof(overlay) - 1] = 0;
   overlayUntil = millis() + OVERLAY_MS;
   previewNote = -1;             // каждая новая подсказка сама решает, что подсвечивать
+  dispDirty = true;
+}
+
+// Два коротких call меньше двух копий AVR-кода сброса.
+void __attribute__((noinline)) clearOverlay() {
+  overlayUntil = 0;
+  previewNote = -1;
   dispDirty = true;
 }
 
@@ -1400,6 +1422,8 @@ uint8_t maskToneAt(uint16_t mask, uint8_t wanted) {
   return 0;
 }
 
+uint8_t wrapPitchClass(int16_t root);
+
 uint8_t buildScaleProfileChord(uint8_t key, uint8_t *out) {
   const uint8_t profile = chordProfile < CHORD_PROFILE_COUNT ? chordProfile : 0;
   uint8_t limit = chordVoiceCount;
@@ -1415,11 +1439,15 @@ uint8_t buildScaleProfileChord(uint8_t key, uint8_t *out) {
       work[count++] = ladderNote(keyLadder[key] + offset) + registerShift;
     }
   }
+  // Slot 0 у каждого профиля — root: повторно ladderNote не вычисляем.
+  chordCaption = (uint8_t)((Q_AUG + 1 + profile) << 4) |
+                 wrapPitchClass(work[0]);
   return finishVoicing(work, count, curScale.period, out);
 }
 
 uint8_t buildQualityChord(int16_t root, uint8_t quality, uint8_t *out) {
   if (quality > Q_AUG) return 0;
+  chordCaption = (uint8_t)(quality << 4) | wrapPitchClass(root);
   const uint16_t mask = pgm_read_word(&QUALITY_MASKS[quality]);
   const uint8_t toneCount = countMaskTones(mask);
   uint8_t target = chordVoiceCount;
@@ -1442,8 +1470,8 @@ uint8_t buildQualityChord(int16_t root, uint8_t quality, uint8_t *out) {
 }
 
 uint8_t wrapPitchClass(int16_t root) {
-  if (root < 0) root += 12;
-  else if (root >= 12) root -= 12;
+  while (root < 0) root += 12;
+  while (root >= 12) root -= 12;
   return (uint8_t)root;
 }
 
@@ -1520,6 +1548,13 @@ uint8_t buildHarmonyChord(uint8_t key, uint8_t octMask, uint8_t *out) {
   return 0;
 }
 
+void fmtHarmonyChord() {
+  char *p = putStr(lastEvent, NOTE_NAMES[chordCaption & 0x0F]);
+  p = putChordLabel(p, chordCaption >> 4);
+  *p = 0;
+  clearOverlay();
+}
+
 void selectPlrPalette(bool extended) {
   if (extended == plrExtended) return;
   plrExtended = extended;
@@ -1571,6 +1606,7 @@ void onKeyChange(uint8_t idx, bool down) {
         uint8_t chord[CHORD_VOICES];
         const uint8_t n = buildHarmonyChord((uint8_t)j, octMask, chord);
         pressNoteSet(sounding[j], chord, n);
+        if (n) fmtHarmonyChord();
       } else {
         pressNoteSource(sounding[j], playedNote((uint8_t)j));
       }
@@ -2016,9 +2052,7 @@ void applyMinimumBrightness() {
 void displayTask() {
   const uint32_t now = millis();
   if (overlayUntil && (int32_t)(now - overlayUntil) >= 0) {
-    overlayUntil = 0;
-    previewNote = -1;
-    dispDirty = true;
+    clearOverlay();
   }
   if (!hasOled) return;
 
